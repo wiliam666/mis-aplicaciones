@@ -1,0 +1,510 @@
+mkdir -p port_auditor/src && cd port_auditor
+
+cat > Cargo.toml <<'EOF'
+[package]
+name = "port-audit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+EOF
+
+cat > src/main.rs <<'EOF'
+use clap::Parser;
+use futures::{stream, StreamExt};
+use serde_json::json;
+use std::collections::{BTreeSet, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio::time::MissedTickBehavior;
+
+const MAX_HOSTS: usize = 4096;
+const MAX_CONNECTIONS: usize = 2_000_000;
+const MAX_CONCURRENCY: usize = 512;
+const MAX_RATE: u32 = 2000;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "port-audit",
+    version,
+    about = "Auditor TCP para hosts y redes autorizadas",
+    after_help = "Aviso: usa esta herramienta solo en sistemas que administres o para los que tengas autorizacion explicita."
+)]
+struct Args {
+    #[arg(
+        required = true,
+        num_args = 1..,
+        help = "IP, CIDR IPv4 o hostname. Se puede repetir."
+    )]
+    targets: Vec<String>,
+
+    #[arg(
+        short,
+        long,
+        default_value = "22,80,443,3000,3306,5432,6379,8000,8080,8443",
+        help = "Puertos: 22,80,443 o rangos 1-1024."
+    )]
+    ports: String,
+
+    #[arg(long, default_value_t = 500, help = "Timeout por puerto en milisegundos.")]
+    timeout_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = 64,
+        help = "Conexiones simultaneas (1-512)."
+    )]
+    concurrency: usize,
+
+    #[arg(
+        long,
+        default_value_t = 200,
+        help = "Maximo de conexiones por segundo (1-2000)."
+    )]
+    rate: u32,
+
+    #[arg(
+        long,
+        default_value_t = 256,
+        help = "Maximo de hosts a escanear (limite duro 4096)."
+    )]
+    max_hosts: usize,
+
+    #[arg(
+        long,
+        default_value_t = 100_000,
+        help = "Maximo total de conexiones (limite duro 2000000)."
+    )]
+    max_connections: usize,
+
+    #[arg(long, help = "Muestra el resultado en JSON.")]
+    json: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PortState {
+    Open,
+    Closed,
+    Filtered,
+}
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+
+    if let Err(message) = run(args).await {
+        eprintln!("error: {message}");
+        std::process::exit(2);
+    }
+}
+
+async fn run(args: Args) -> Result<(), String> {
+    if args.max_hosts == 0 || args.max_hosts > MAX_HOSTS {
+        return Err(format!(
+            "--max-hosts debe estar entre 1 y {MAX_HOSTS}"
+        ));
+    }
+    if args.max_connections == 0 || args.max_connections > MAX_CONNECTIONS {
+        return Err(format!(
+            "--max-connections debe estar entre 1 y {MAX_CONNECTIONS}"
+        ));
+    }
+
+    let ips = resolve_targets(&args.targets, args.max_hosts)?;
+    let ports = parse_ports(&args.ports)?;
+    let total = ips.len().saturating_mul(ports.len());
+
+    if total > args.max_connections {
+        return Err(format!(
+            "el escaneo requiere {total} conexiones y supera --max-connections {}; reduce objetivos o puertos, o sube el limite",
+            args.max_connections
+        ));
+    }
+
+    let concurrency = args.concurrency.clamp(1, MAX_CONCURRENCY);
+    let rate = args.rate.clamp(1, MAX_RATE);
+    let timeout = Duration::from_millis(args.timeout_ms.clamp(50, 10_000));
+
+    eprintln!("Aviso: audita solo hosts y redes para los que tengas autorizacion.");
+
+    let started = Instant::now();
+    let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / rate as f64));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let ticker = Arc::new(Mutex::new(interval));
+
+    let mut work = Vec::with_capacity(total);
+    for ip in &ips {
+        for port in &ports {
+            work.push((*ip, *port));
+        }
+    }
+
+    let results = stream::iter(work)
+        .map(|(ip, port)| {
+            let ticker = Arc::clone(&ticker);
+            async move {
+                ticker.lock().await.tick().await;
+                let state = scan_port(ip, port, timeout).await;
+                (ip, port, state)
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    tokio::pin!(results);
+
+    let mut open = BTreeSet::new();
+    let mut closed = 0usize;
+    let mut filtered = 0usize;
+
+    while let Some((ip, port, state)) = results.next().await {
+        match state {
+            PortState::Open => {
+                open.insert((ip, port));
+            }
+            PortState::Closed => closed += 1,
+            PortState::Filtered => filtered += 1,
+        }
+    }
+
+    let elapsed = started.elapsed();
+
+    if args.json {
+        print_json(&ips, &ports, total, &open, closed, filtered, elapsed)?;
+    } else {
+        print_text(&ips, &ports, total, &open, closed, filtered, elapsed);
+    }
+
+    Ok(())
+}
+
+async fn scan_port(ip: IpAddr, port: u16, timeout: Duration) -> PortState {
+    let address = SocketAddr::new(ip, port);
+
+    match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
+        Ok(Ok(_stream)) => PortState::Open,
+        Ok(Err(_)) => PortState::Closed,
+        Err(_) => PortState::Filtered,
+    }
+}
+
+fn resolve_targets(targets: &[String], max_hosts: usize) -> Result<Vec<IpAddr>, String> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+
+    for target in targets {
+        let target = target.trim();
+        if target.is_empty() {
+            continue;
+        }
+
+        let addresses: Vec<IpAddr> = if target.contains('/') {
+            expand_ipv4_cidr(target, max_hosts)?
+        } else if let Ok(ip) = target.parse::<IpAddr>() {
+            vec![ip]
+        } else {
+            let resolved = (target, 0)
+                .to_socket_addrs()
+                .map_err(|error| format!("no se pudo resolver '{target}': {error}"))?;
+            let mut addresses = Vec::new();
+            for socket in resolved {
+                addresses.push(socket.ip());
+            }
+            if addresses.is_empty() {
+                return Err(format!("'{target}' no tiene direcciones IP"));
+            }
+            addresses
+        };
+
+        for address in addresses {
+            if seen.insert(address) {
+                result.push(address);
+                if result.len() > max_hosts {
+                    return Err(format!(
+                        "se superaron los {max_hosts} hosts permitidos; usa --max-hosts para ampliar el limite"
+                    ));
+                }
+            }
+        }
+    }
+
+    if result.is_empty() {
+        return Err("no se proporcionaron objetivos validos".to_string());
+    }
+
+    Ok(result)
+}
+
+fn expand_ipv4_cidr(text: &str, max_hosts: usize) -> Result<Vec<IpAddr>, String> {
+    let (address, prefix) = text
+        .split_once('/')
+        .ok_or_else(|| format!("CIDR invalido: '{text}'"))?;
+
+    let base: Ipv4Addr = address
+        .parse()
+        .map_err(|_| format!("IPv4 invalida en CIDR: '{text}'"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| format!("prefijo invalido en CIDR: '{text}'"))?;
+
+    if prefix > 32 {
+        return Err(format!("prefijo fuera de rango en CIDR: '{text}'"));
+    }
+
+    let base = u32::from(base);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let network = base & mask;
+    let broadcast = network | !mask;
+
+    let (first, last, host_count) = if prefix >= 31 {
+        (network, broadcast, 1u64 << (32 - prefix))
+    } else {
+        let usable = (1u64 << (32 - prefix)) - 2;
+        (network + 1, broadcast - 1, usable)
+    };
+
+    if host_count > max_hosts as u64 {
+        return Err(format!(
+            "el CIDR '{text}' contiene {host_count} hosts y supera --max-hosts {max_hosts}"
+        ));
+    }
+
+    let mut addresses = Vec::with_capacity(host_count as usize);
+    let mut current = first;
+
+    loop {
+        addresses.push(IpAddr::V4(Ipv4Addr::from(current)));
+        if current == last {
+            break;
+        }
+        current += 1;
+    }
+
+    Ok(addresses)
+}
+
+fn parse_ports(spec: &str) -> Result<Vec<u16>, String> {
+    let mut ports = BTreeSet::new();
+
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        if let Some((start, end)) = part.split_once('-') {
+            let start: u16 = start
+                .trim()
+                .parse()
+                .map_err(|_| format!("puerto invalido: '{part}'"))?;
+            let end: u16 = end
+                .trim()
+                .parse()
+                .map_err(|_| format!("puerto invalido: '{part}'"))?;
+
+            if start == 0 || end == 0 || start > end {
+                return Err(format!("rango de puertos invalido: '{part}'"));
+            }
+
+            for port in start..=end {
+                ports.insert(port);
+            }
+        } else {
+            let port: u16 = part
+                .parse()
+                .map_err(|_| format!("puerto invalido: '{part}'"))?;
+
+            if port == 0 {
+                return Err("el puerto 0 no es valido".to_string());
+            }
+
+            ports.insert(port);
+        }
+    }
+
+    if ports.is_empty() {
+        return Err("no se especificaron puertos".to_string());
+    }
+
+    Ok(ports.into_iter().collect())
+}
+
+fn service_name(port: u16) -> &'static str {
+    match port {
+        21 => "ftp",
+        22 => "ssh",
+        23 => "telnet",
+        25 => "smtp",
+        53 => "dns",
+        80 => "http",
+        110 => "pop3",
+        143 => "imap",
+        443 => "https",
+        445 => "smb",
+        465 => "smtps",
+        587 => "submission",
+        993 => "imaps",
+        995 => "pop3s",
+        1433 => "mssql",
+        1521 => "oracle",
+        2049 => "nfs",
+        3306 => "mysql",
+        3389 => "rdp",
+        5432 => "postgresql",
+        5672 => "amqp",
+        5900 => "vnc",
+        6379 => "redis",
+        8080 => "http-alt",
+        8443 => "https-alt",
+        9200 => "elasticsearch",
+        27017 => "mongodb",
+        _ => "desconocido",
+    }
+}
+
+fn print_text(
+    ips: &[IpAddr],
+    ports: &[u16],
+    total: usize,
+    open: &BTreeSet<(IpAddr, u16)>,
+    closed: usize,
+    filtered: usize,
+    elapsed: Duration,
+) {
+    println!();
+    println!(
+        "Auditoria TCP: {} host(s), {} puerto(s), {} conexion(es)",
+        ips.len(),
+        ports.len(),
+        total
+    );
+
+    if open.is_empty() {
+        println!("No se encontraron puertos abiertos.");
+    } else {
+        println!();
+        let mut current: Option<IpAddr> = None;
+
+        for (ip, port) in open.iter() {
+            if current != Some(*ip) {
+                if current.is_some() {
+                    println!();
+                }
+                println!("{ip}");
+                current = Some(*ip);
+            }
+            println!("  {:<5}/tcp  {}", port, service_name(*port));
+        }
+    }
+
+    println!();
+    println!(
+        "Resumen: {} abierto(s), {} cerrado(s), {} filtrado(s)/sin respuesta en {:.2} s",
+        open.len(),
+        closed,
+        filtered,
+        elapsed.as_secs_f64()
+    );
+}
+
+fn print_json(
+    ips: &[IpAddr],
+    ports: &[u16],
+    total: usize,
+    open: &BTreeSet<(IpAddr, u16)>,
+    closed: usize,
+    filtered: usize,
+    elapsed: Duration,
+) -> Result<(), String> {
+    let open_json: Vec<_> = open
+        .iter()
+        .map(|(ip, port)| {
+            json!({
+                "host": ip.to_string(),
+                "port": port,
+                "service": service_name(*port),
+            })
+        })
+        .collect();
+
+    let report = json!({
+        "hosts": ips.len(),
+        "ports": ports.len(),
+        "connections": total,
+        "open": open_json,
+        "closed": closed,
+        "filtered": filtered,
+        "elapsed_seconds": elapsed.as_secs_f64(),
+    });
+
+    let rendered = serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?;
+    println!("{rendered}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ports_and_ranges() {
+        let ports = parse_ports("22,80,100-102").unwrap();
+        assert_eq!(ports, vec![22, 80, 100, 101, 102]);
+    }
+
+    #[test]
+    fn rejects_invalid_ports() {
+        assert!(parse_ports("0").is_err());
+        assert!(parse_ports("10-5").is_err());
+        assert!(parse_ports("70000").is_err());
+    }
+
+    #[test]
+    fn expands_thirty_bit_cidr_to_two_hosts() {
+        let addresses = expand_ipv4_cidr("192.168.1.0/30", 10).unwrap();
+        assert_eq!(
+            addresses,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_both_addresses_of_thirty_one_bit_cidr() {
+        let addresses = expand_ipv4_cidr("10.0.0.0/31", 10).unwrap();
+        assert_eq!(
+            addresses,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_cidr_over_the_host_limit() {
+        assert!(expand_ipv4_cidr("10.0.0.0/24", 100).is_err());
+    }
+}
+EOF
+
+cargo build --release
+./target/release/port-audit 127.0.0.1 -p 22,80,443
