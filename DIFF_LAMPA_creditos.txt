@@ -1,0 +1,680 @@
+--- Lampa_orig.html	2026-09-26 18:35:59.924703663 +0000
++++ "/mnt/sdcard/Download/open code/SILAB_01_Lampa_CORREGIDO-2open.html"	2026-09-26 19:01:10.382406814 +0000
+@@ -5172,42 +5172,31 @@
+   // al autor de cada examen (t.performedBy). No se reparte el UVR total de la
+   // ficha por cantidad de exámenes: quien hace una orina recibe 5, quien hace el
+   // hemograma recibe 12, sin dilución entre personas.
++  /* ============================================================
++     UNA SOLA FUENTE DE VERDAD: esta funcion NO duplica la tabla de
++     factores MINSA ni recalcula UVR por examen (antes tenia una
++     testUvr() local desfasada). El UVR por autor viene directamente de
++     credits, que genera classifyTestsForReport en el mismo punto donde
++     decide cada factor. Aqui solo se agrega por mes y por actor, y se
++     cuenta el numero de examenes reales de rec.tests (por performedById)
++     para la columna de examenes. Nunca reintroducir una tabla duplicada.
++     ============================================================ */
+   function computeProductivity(desdeKey, hastaKey){
+-    // UVR por EXAMEN (no por ficha): cada examen aporta su factor MINSA real y
+-    // ese UVR se asigna ÍNTEGRO a la persona que figura como autor de ese examen
+-    // (t.performedBy / performedById). Antes se calculaba el UVR total de la
+-    // ficha con classifyTestsForReport y se repartía proporcional al número de
+-    // exámenes de cada persona (frac = cuenta/totalTests), lo que diluía el
+-    // aporte de quienes hacían pocos exámenes de alto/medio valor (ej. orina
+-    // completa = 5) cuando en la misma ficha había muchos componentes de
+-    // hemograma u otros tests hechos por otras personas. Ahora quien hace una
+-    // orina recibe 5, quien hace el hemograma recibe 12, y no se diluyen entre
+-    // sí. Se mantienen las mismas banderas de agrupación y la misma tabla de
+-    // factores MINSA que usa classifyTestsForReport / REPORT_COLUMNS, para que
+-    // el total del periodo coincida con el del Informe Mensual.
++    // Se agrupa por ID de usuario (t.performedById / rec.creadoPorId / e.userId),
++    // NO por el texto del nombre. Antes se agrupaba por nombre, así que si a un
++    // usuario le editaban el nombre o la colegiatura (p.ej. "Lic. Fulano" vs
++    // "Lic. Fulano-14597"), los registros guardados con el nombre antiguo salían
++    // como una "persona" aparte de los guardados con el nombre nuevo, aunque
++    // fuera el mismo usuario. Si un registro muy antiguo no tiene ID guardado,
++    // se agrupa por el nombre como respaldo.
+     function actorKeyAndName(id, fallbackName){
+       const u = id ? users.find(x=>x.id===id) : null;
+       const nombre = u ? u.nombre : (fallbackName || '(sin asignar)');
+       const key = id || `n:${fallbackName || '(sin asignar)'}`;
+       return { key, nombre };
+     }
+-    const colFactor = (k)=>{ const c = REPORT_COLUMNS.find(c=>c.key===k); return c ? c.factor : 0; };
+     const porUsuario = {}; // actorKey -> {nombre, examenes, uvr}
+     const porMes = {};     // "yyyy-mm" -> { actorKey -> {nombre, examenes, uvr} }
+-    function addExamen(actorKey, nombre, key, n){
+-      if(!porUsuario[actorKey]) porUsuario[actorKey] = {nombre, examenes:0, uvr:0};
+-      porUsuario[actorKey].examenes += n;
+-      if(!porMes[key]) porMes[key] = {};
+-      if(!porMes[key][actorKey]) porMes[key][actorKey] = {nombre, examenes:0, uvr:0};
+-      porMes[key][actorKey].examenes += n;
+-    }
+-    function addUvr(actorKey, nombre, key, uv){
+-      if(!porUsuario[actorKey]) porUsuario[actorKey] = {nombre, examenes:0, uvr:0};
+-      porUsuario[actorKey].uvr += uv;
+-      if(!porMes[key]) porMes[key] = {};
+-      if(!porMes[key][actorKey]) porMes[key][actorKey] = {nombre, examenes:0, uvr:0};
+-      porMes[key][actorKey].uvr += uv;
+-    }
+     records.forEach(rec=>{
+       if(rec.status==='void') return; // no se cuentan los anulados
+       const fm = parseFechaMes(rec.fecha);
+@@ -5216,120 +5205,43 @@
+       if(key < desdeKey || key > hastaKey) return;
+       const tests = rec.tests||[];
+       if(!tests.length) return;
+-      // Pacientes de campaña: igual que el informe mensual, el multiplicador se
+-      // aplica a la UVR de cada examen y la fase preanalítica es un monto fijo
+-      // adicional (sin multiplicar) por paciente.
+-      const mul = rec.esCampanaSalud ? campanaConfig.multiplicador : 1;
+-      const creador = actorKeyAndName(rec.creadoPorId||'', rec.creadoPor || '(sin asignar)');
+-      const autorDe = (t)=> actorKeyAndName(t.performedById || rec.creadoPorId || '', t.performedBy || rec.creadoPor || '(sin asignar)');
+-      // Mismas banderas de agrupación que usa classifyTestsForReport.
+-      const hasHemograma = (rec.packages||[]).includes('Hemograma Completo') || tests.some(t=>HEMOGRAMA_COMPONENT_NAMES.includes(t.name));
+-      const hasWidal = (rec.packages||[]).includes('Reacción de Widal');
+-      const hasOrinaCompleta = tests.some(t=>t.name==='Examen completo de orina');
+-      // Autores distintos de un subconjunto de exámenes (para repartir entre
+-      // ellos los UVR "de grupo": hemograma completo y paquete Widal).
+-      const autoresDe = (cond)=>{
+-        const map = {};
+-        tests.forEach(t=>{ if(!cond(t)) return; const a = autorDe(t); map[a.key] = a.nombre; });
+-        return Object.keys(map).map(k=> ({key:k, nombre:map[k]}));
+-      };
+-      // Factor MINSA (UVR) real de UN examen individual, con la misma cascada de
+-      // nombres y las mismas constantes/factores que classifyTestsForReport.
+-      // Devuelve 0 cuando ese examen ya quedó absorbido por un UVR de grupo
+-      // (componente del hemograma con el hemograma completo, sedimento ya
+-      // contado con la orina, o antígeno de Widal ya cubierto por el paquete).
+-      function testUvr(t){
+-        const n = t.name || '';
+-        if(HEMOGRAMA_COMPONENT_NAMES.includes(n)) return 0; // absorbido por el hemograma completo
+-        if(n==='Recuento de plaquetas'){ return hasHemograma ? 0 : 3; }
+-        if(n==='Recuento de hematíes'){ return hasHemograma ? 0 : 3; }
+-        if(n==='Cultivo y Antibiograma' || n==='Urocultivo'){
+-          let uv = cultivoFactorFor(t);
+-          if(t.fields && t.fields.resultado==='Positivo') uv += antibiogramaFactorFor(t);
+-          return uv;
+-        }
+-        if(n==='Baciloscopia (BK - Esputo)'||n==='Baciloscopia (BK)'||n.includes('Baciloscopia')) return countBkMuestras(t)*colFactor('baciloscopia');
+-        if(n==='Secreción Vaginal (Gram y Directo)' || n==='Gram Directo (muestra general)' || n==='KOH (Examen Micológico Directo)') return colFactor('gram');
+-        if(n==='Gota Gruesa (Metaxénicos)') return colFactor('metaxenicos');
+-        if(n==='Espermatograma') return colFactor('espermato');
+-        if(n==='Análisis de Líquidos (punción)') return colFactor('liquidos');
+-        if(n==='Examen Directo de Heces' || n==='Parasitológico Seriado'){
+-          const veces = n==='Parasitológico Seriado' ? countSeriadoMuestras(t) : 1;
+-          return veces*(colFactor('parasitolog') + colFactor('rinflam'));
+-        }
+-        if(n==='Reacción inflamatoria en heces') return colFactor('rinflam');
+-        if(n==='Test de Graham (cinta adhesiva - Enterobius vermicularis)') return countSeriadoMuestras(t)*5;
+-        if(n==='Examen completo de orina') return colFactor('orinas') + colFactor('sedimento');
+-        if(n==='Sedimento urinario'){ return hasOrinaCompleta ? 0 : colFactor('sedimento'); }
+-        if(n==='Ácido sulfosalicílico (proteínas orina)') return 2;
+-        if(n==='Microalbuminuria') return 3;
+-        if(n==='Hematocrito' || n==='Hemoglobina'){ return hasHemograma ? 0 : colFactor('htohb'); }
+-        if(n==='Grupo sanguíneo' || n==='Factor RH') return colFactor('grupo');
+-        if(n==='VSG') return 5;
+-        if(n==='Tiempo de Coagulación' || n==='Tiempo de Sangría') return colFactor('coagsangria');
+-        if(n==='Tiempo de Protrombina' || n==='Tiempo de Tromboplastina Parcial' || n==='Tiempo de Trombina') return OTROS_FACTOR_TP_TTPA;
+-        if(n==='INR') return 1;
+-        if(n==='PCR cuantitativo' || n==='Proteína C Reactiva') return colFactor('pcr');
+-        if(n==='PCR cualitativo') return colFactor('pcr_cual');
+-        if(n==='Test de Sullivan (PTOG 50 g)') return colFactor('bioquimica');
+-        if(n==='Prueba de Tolerancia Oral a la Glucosa (PTOG)') return countPtogDeterminaciones(t)*colFactor('bioquimica');
+-        if(t.area==='Bioquímica Clínica') return colFactor('bioquimica');
+-        if(n==='RPR') return rprDeterminaciones(t)*colFactor('rpr');
+-        if(n==='Sífilis (Prueba rápida)') return colFactor('sifilis_rapida');
+-        if(n.startsWith('Widal -')){ return hasWidal ? 0 : 4; }
+-        if(n==='VIH') return colFactor('vih');
+-        if(n==='Hepatitis B' || n==='HBsAg (Antígeno superficie Hepatitis B)') return 3;
+-        if(n==='Brucella (Rosa de Bengala)') return 4;
+-        if(n==='Brucella (Wright/Tubo)' || n==='Brucella (Wright)') return 6;
+-        if(n==='HCG (prueba de embarazo)' || n==='Test de Embarazo') return colFactor('pregnost');
+-        if(n==='Factor Reumatoide') return colFactor('freumat');
+-        if(n==='ASO') return colFactor('asto');
+-        if(n==='PSA') return 3;
+-        if(n==='Hepatitis C') return 3;
+-        if(n==='VIH (ELISA)') return 6;
+-        if(n==='Chagas') return 3;
+-        if(n==='VDRL') return 4;
+-        if(n==='TASS') return 4;
+-        if(n==='Aglutinaciones') return 4;
+-        if(n==='Proteinuria cualitativa') return 2;
+-        if(n==='Proteinuria 24 horas') return 5;
+-        if(n==='Proteinuria fraccionada') return 5;
+-        if(n==='Albúmina urinaria') return 3;
+-        if(n==='Sangre oculta en heces') return 3;
+-        return 4; // genérico OTROS (sin factor específico conocido), igual que el informe mensual
+-      }
+-      // Reparto de un UVR "de grupo" solo entre quienes hicieron sus componentes
+-      // (reparto equitativo, sin mezclarlo con exámenes de otras personas); si
+-      // no hay componentes registrados, se asigna íntegro a quien creó la ficha.
+-      function repartir(cond, total){
+-        const autores = autoresDe(cond);
+-        if(autores.length){ const share = total/autores.length; autores.forEach(a=> addUvr(a.key, a.nombre, key, share)); }
+-        else addUvr(creador.key, creador.nombre, key, total);
+-      }
+-      // Hemograma completo: factor 12 UNA SOLA VEZ (nunca 12 por componente).
+-      // Paquete Widal: 16 por los 4 antígenos, una sola vez.
+-      if(hasHemograma) repartir(t=>HEMOGRAMA_COMPONENT_NAMES.includes(t.name), 12*mul);
+-      if(hasWidal) repartir(t=>String(t.name||'').startsWith('Widal -'), 16*mul);
+-      // Exámenes individuales: cada uno suma su factor MINSA íntegro a su autor,
+-      // sin dividirlo por la cantidad de exámenes de la ficha.
++      // ---- UVR por autor, examen por examen (ya no proporcional) ----
++      // classifyTestsForReport ahora también devuelve `credits`: cada entrada
++      // ya trae el factor MINSA real del examen concreto y quién lo hizo. No
++      // se reparte el UVR total de la ficha por cantidad de exámenes — cada
++      // persona recibe exactamente el valor de lo que ella hizo (ver
++      // conversación de corrección de UVR por productividad).
++      const { credits } = classifyTestsForReport(rec);
++      // Nº de exámenes realizados por persona (para la columna "exámenes"):
++      // se cuenta por examen real de rec.tests, igual que antes, NO por cada
++      // entrada de `credits` (el hemograma/widal generan varias entradas de
++      // crédito pero siguen siendo 1 examen del paciente cada uno).
++      const porPersonaCuenta = {}; // actorKey -> {nombre, cuenta}
+       tests.forEach(t=>{
+-        const a = autorDe(t);
+-        addExamen(a.key, a.nombre, key, 1);
+-        const uv = testUvr(t)*mul;
+-        if(uv) addUvr(a.key, a.nombre, key, uv);
+-      });
+-      // Toma de muestra sanguínea: una sola punción por ficha (misma regla del
+-      // informe mensual); se asume que quien registra el resultado es quien
+-      // tomó la muestra, así que va al creador de la ficha.
+-      if(tests.some(t => sampleKindOf(defaultSampleFor(t)) === 'sangre')){
+-        addUvr(creador.key, creador.nombre, key, 5*mul);
+-      }
+-      // Campaña de salud: el multiplicador ya se aplicó arriba a cada UVR; la
+-      // fase preanalítica masiva es un monto fijo por paciente de campaña (no
+-      // multiplicado) que se asigna al creador de la ficha.
+-      if(rec.esCampanaSalud){
+-        addUvr(creador.key, creador.nombre, key, campanaConfig.preanalitica);
+-      }
++        const id = t.performedById || rec.creadoPorId || '';
++        const fallback = t.performedBy || rec.creadoPor || '(sin asignar)';
++        const { key: actorKey, nombre } = actorKeyAndName(id, fallback);
++        if(!porPersonaCuenta[actorKey]) porPersonaCuenta[actorKey] = {nombre, cuenta:0};
++        porPersonaCuenta[actorKey].cuenta++;
++      });
++      Object.keys(porPersonaCuenta).forEach(actorKey=>{
++        const {nombre, cuenta} = porPersonaCuenta[actorKey];
++        if(!porUsuario[actorKey]) porUsuario[actorKey] = {nombre, examenes:0, uvr:0};
++        porUsuario[actorKey].examenes += cuenta;
++        if(!porMes[key]) porMes[key] = {};
++        if(!porMes[key][actorKey]) porMes[key][actorKey] = {nombre, examenes:0, uvr:0};
++        porMes[key][actorKey].examenes += cuenta;
++      });
++      // UVR: se suma íntegro el factor de cada crédito a quien lo hizo (sin
++      // fracción/proporción sobre el total de la ficha).
++      credits.forEach(c=>{
++        const { key: actorKey, nombre } = actorKeyAndName(c.actorId, c.actorName);
++        if(!porUsuario[actorKey]) porUsuario[actorKey] = {nombre, examenes:0, uvr:0};
++        porUsuario[actorKey].uvr += c.factor;
++        if(!porMes[key]) porMes[key] = {};
++        if(!porMes[key][actorKey]) porMes[key][actorKey] = {nombre, examenes:0, uvr:0};
++        porMes[key][actorKey].uvr += c.factor;
++      });
+     });
+     // Uso de la app: cuenta las acciones de auditoría guardadas en ESTE equipo
+     // dentro del periodo (crear, editar, liberar, corregir, anular, imprimir, exportar).
+@@ -7944,8 +7856,26 @@
+   // exámenes sueltos (uno por línea) en vez de usar el paquete "Hemograma
+   // Completo". Si aparecen en la ficha, esa ficha cuenta como 1 hemograma
+   // completo (no se cuentan aparte ni cayendo en "OTROS").
+-  const HEMOGRAMA_COMPONENT_NAMES = ['Recuento de leucocitos','Neutrófilos segmentados','Neutrófilos abastonados',
+-    'Linfocitos','Monocitos','Basófilos','Eosinófilos','Mielocitos','Juveniles'];
++    // Accessor del factor MINSA activo de una columna, leído de REPORT_COLUMNS.
++  // classifyTestsForReport lo usa para la bioquímica (Ilave 3, manual - Lampa
++  // 1, automatizado) y para OTROS/TP·TTPA, sin duplicar literales en otra
++  // función que se desincronicen con el cuadro de Informe Mensual.
++  const colFactor = (k)=>{ const c = REPORT_COLUMNS.find(c=>c.key===k); return c ? c.factor : 0; };
++
++  const HEMOGRAMA_PKG_NAMES = ['Hemograma Completo', 'Hemograma Completo (manual)',
++    'Hemograma Completo (5 diferenciales - automatizado)', 'Hemograma Completo (3 diferenciales - automatizado)',
++    // nombres intermedios usados brevemente entre versiones, por si quedó algún registro con ellos
++    'Hemograma Completo (5 diferenciales)', 'Hemograma Completo (3 diferenciales)'];
++
++  const HEMOGRAMA_COMPONENT_NAMES = ['Recuento de leucocitos','Recuento de hematíes','Neutrófilos segmentados','Neutrófilos abastonados',
++    'Linfocitos','Monocitos','Basófilos','Eosinófilos','Mielocitos','Juveniles',
++    // Parámetros propios del hemograma automatizado (equipo WB-CBC+DIFF): si
++    // aparecen sueltos (sin marcar el paquete "Hemograma Completo"), igual se
++    // cuentan como parte de UN hemograma completo, no cada uno por separado.
++    'RDW-CV','RDW-SD','MPV','PDW','PCT (Plaquetocrito)','P-LCC','P-LCR',
++    // Diferencial de 5 poblaciones del equipo automatizado (Neutrófilos sin
++    // separar seg/abastonados) y diferencial de 3 poblaciones (MID/Granulocitos)
++    'Neutrófilos','Células intermedias (MID)','Granulocitos'];
+ 
+   // Devuelve todos los "casilleros" de muestra REAL de un examen BK (m1, m2, la
+   // muestra adicional si se activó, y el control de tratamiento si se activó),
+@@ -8022,172 +7952,269 @@
+     return n || 1;
+   }
+ 
++  /* ============================================================
++     ARQUITECTURA DE UNA SOLA FUENTE DE VERDAD (alineada con SILAB
++     Putina, referencia canonica). classifyTestsForReport es el UNICO
++     punto donde se decide el UVR real de cada examen, el conteo entero
++     de examenes (inc) y el credito por autor (credits). El informe
++     mensual y computeProductivity consumen estas 4 estructuras.
++     Nunca recalcular factores en otro lugar ni mezclar conteo con UVR.
++     ============================================================ */
+   function classifyTestsForReport(rec){
+-    const inc = {}; const add=(k,n=1)=>{ inc[k]=(inc[k]||0)+n; };
+-    // UVR real de las columnas de factor variable (cultivo/antibiograma), aparte
+-    // del conteo entero de exámenes en "inc". Ver VARIABLE_FACTOR_COLS.
+-    const uvr = {}; const addUvr=(k,n)=>{ uvr[k]=(uvr[k]||0)+n; };
+-    const otrosNames = [];
+-    const pkgs = rec.packages || [];
+-    const tests = rec.tests || [];
+-    const hasHemogramaComponentes = tests.some(t=>HEMOGRAMA_COMPONENT_NAMES.includes(t.name));
+-    const hasHemograma = pkgs.includes('Hemograma Completo') || hasHemogramaComponentes;
+-    const hasWidal = pkgs.includes('Reacción de Widal');
+-    const hasOrinaCompleta = tests.some(t=>t.name==='Examen completo de orina');
+-    if(hasHemograma) add('hemograma');
+-    // BUG CORREGIDO (08/09/2026): antes, un antígeno de Widal SUELTO (sin el
+-    // paquete completo) costaba lo mismo que el paquete entero (16), porque
+-    // la columna WIDAL tenía un factor fijo único. Ahora "widal" es de
+-    // factor variable: el paquete completo (4 antígenos) sigue costando 16
+-    // en total, pero cada antígeno suelto vale 4 (16 ÷ 4), proporcional a
+-    // cuántos antígenos realmente se hicieron.
+-    if(hasWidal){ add('widal', 1); addUvr('widal', 16); }
+-    tests.forEach(t=>{
+-      const n = t.name;
+-      // Si aparece cualquier componente del hemograma (aunque sea uno solo), esta
+-      // ficha ya se contabilizó arriba como 1 hemograma completo (diseño existente:
+-      // en la práctica estos componentes solo se registran sueltos cuando en
+-      // realidad se hizo el hemograma completo por partes).
+-      if(HEMOGRAMA_COMPONENT_NAMES.includes(n)) return;
+-      // Recuento de plaquetas suelto, Ácido sulfosalicílico, Microalbuminuria,
+-      // VSG, TP/TTPA e INR: van dentro de la columna "OTROS" (como estaban
+-      // antes, visualmente agrupados ahí), pero aportan su propio factor real
+-      // de la tabla MINSA en vez del factor genérico de OTROS.
+-      if(n==='Recuento de plaquetas'){ if(!hasHemograma){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); } return; }
+-      // BUG CORREGIDO (08/09/2026): "Recuento de hematíes" no estaba en
+-      // HEMOGRAMA_COMPONENT_NAMES ni tenía regla propia, así que caía en el
+-      // genérico OTROS(4) SIEMPRE — incluso cuando ya venía incluido dentro
+-      // de un Hemograma Completo (factor 12), duplicando el cobro. Ahora
+-      // sigue el mismo criterio que Hemoglobina/Hematocrito/Plaquetas: si
+-      // va suelto (sin hemograma completo), factor 3; si es parte del
+-      // hemograma, se absorbe sin cobro aparte.
+-      if(n==='Recuento de hematíes'){ if(!hasHemograma){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); } return; }
+-      if(n==='Cultivo y Antibiograma' || n==='Urocultivo'){
+-        // Nº de exámenes realizados: SIEMPRE un conteo entero (1 cultivo por
+-        // ficha — nunca una fracción ni el factor). El factor MINSA real,
+-        // que sí varía según los controles de lectura cada 12 h que
+-        // realmente se hicieron (ver cultivoFactorFor), se acumula aparte
+-        // en "uvr" para el cuadro de determinaciones/UVR, sin mezclarse con
+-        // el conteo de exámenes.
+-        add('cultivo', 1);
+-        addUvr('cultivo', cultivoFactorFor(t));
+-        // El antibiograma solo se habilita (y se factura) cuando el cultivo
+-        // salió Positivo; si es Negativo no corresponde antibiograma.
+-        if(t.fields && t.fields.resultado==='Positivo'){
+-          add('antibiograma', antibiogramaRoundsCount(t));
+-          addUvr('antibiograma', antibiogramaFactorFor(t));
+-        }
+-        return;
+-      }
+-      if(n==='Baciloscopia (BK - Esputo)'||n==='Baciloscopia (BK)'||(n||'').includes('Baciloscopia')) return add('baciloscopia', countBkMuestras(t));
+-      if(n==='Secreción Vaginal (Gram y Directo)' || n==='Gram Directo (muestra general)' || n==='KOH (Examen Micológico Directo)') return add('gram');
+-      if(n==='Gota Gruesa (Metaxénicos)') return add('metaxenicos');
+-      if(n==='Espermatograma') return add('espermato');
+-      if(n==='Análisis de Líquidos (punción)') return add('liquidos');
+-      if(n==='Examen Directo de Heces' || n==='Parasitológico Seriado'){
+-        // Cada muestra del seriado se cuenta y vale exactamente igual que un
+-        // Examen Directo de Heces (mismo factor MINSA) — NO como un único
+-        // examen combinado — porque son muestras de días distintos, cada una
+-        // con sus propias características: 1 muestra = 1 examen, 2 muestras =
+-        // 2 exámenes, 3 muestras = 3 exámenes. El Examen Directo (una sola
+-        // muestra) siempre cuenta como 1. La reacción inflamatoria
+-        // (leucocitos/moco en heces) se realiza junto con el parasitológico
+-        // sobre la misma muestra, así que se contabiliza igual, veces por veces.
+-        const veces = n==='Parasitológico Seriado' ? countSeriadoMuestras(t) : 1;
+-        add('parasitolog', veces); addUvr('parasitolog', veces*6);
+-        add('rinflam', veces); return;
+-      }
+-      if(n==='Reacción inflamatoria en heces') return add('rinflam'); // a veces se pide solo esta, sin el parasitológico
+-      if(n==='Test de Graham (cinta adhesiva - Enterobius vermicularis)'){
+-        // Factor MINSA real del Test de Graham: 5 (catálogo oficial), distinto
+-        // del factor de PARASITOLOG. (6) con el que comparte columna en el
+-        // cuadro base — por eso se acumula aparte con addUvr en vez de dejar
+-        // que el factor genérico de la columna (6) lo calcule por sí solo.
+-        // Igual que el Seriado, cada muestra (I/II/III) cuenta y vale como
+-        // examen aparte. Sin reacción inflamatoria, que no aplica a esta
+-        // muestra (no es heces).
+-        const veces = countSeriadoMuestras(t);
+-        add('parasitolog', veces); addUvr('parasitolog', veces*5);
+-        return;
+-      }
+-      if(n==='Examen completo de orina'){
+-        // El sedimento urinario se hace siempre junto con el examen completo
+-        // de orina, sobre la misma muestra: se contabilizan ambos.
+-        add('orinas'); add('sedimento'); return;
+-      }
+-      if(n==='Sedimento urinario'){ if(!hasOrinaCompleta) add('sedimento'); return; }
+-      if(n==='Ácido sulfosalicílico (proteínas orina)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 2); return; }
+-      if(n==='Microalbuminuria'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); return; }
+-      if(n==='Hematocrito' || n==='Hemoglobina'){ if(!hasHemograma) add('htohb'); return; }
+-      if(n==='Grupo sanguíneo' || n==='Factor RH') return add('grupo');
+-      if(n==='VSG'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 5); return; }
+-      if(n==='Tiempo de Coagulación' || n==='Tiempo de Sangría') return add('coagsangria');
+-      if(n==='Tiempo de Protrombina' || n==='Tiempo de Tromboplastina Parcial' || n==='Tiempo de Trombina'){
+-        // BUG CORREGIDO (08/09/2026): "Tiempo de Trombina" nunca estaba en
+-        // esta condición, así que caía en el genérico OTROS(4) en vez de
+-        // valer lo mismo que TP/TTPA (misma técnica de coagulación).
+-        otrosNames.push(n); add('otros', 1); addUvr('otros', OTROS_FACTOR_TP_TTPA); return;
+-      }
+-      if(n==='INR'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 1); return; }
+-      // PCR: cuantitativo (bioq) y cualitativo (inmuno) → columna P.C.R.
+-      if(n==='PCR cuantitativo' || n==='Proteína C Reactiva') return add('pcr'); // valores numéricos (bioquímica)
+-      if(n==='PCR cualitativo') return add('pcr_cual'); // Negativo / + / ++ / +++ (inmunoserología)
+-      if(n==='Test de Sullivan (PTOG 50 g)') return add('bioquimica'); // tamizaje: 1 sola determinación (glucosa a la 1h)
+-      if(n==='Prueba de Tolerancia Oral a la Glucosa (PTOG)') return add('bioquimica', countPtogDeterminaciones(t)); // cada determinación de glucosa cargada (ayunas/1h/2h/3h) es un examen bioquímico aparte
+-      if(t.area==='Bioquímica Clínica') return add('bioquimica');
+-      if(n==='RPR') return add('rpr', rprDeterminaciones(t));
+-      if(n==='Sífilis (Prueba rápida)') return add('sifilis_rapida');
+-      if(n.startsWith('Widal -')){ if(!hasWidal){ add('widal', 1); addUvr('widal', 4); } return; }
+-      if(n==='VIH') return add('vih');
+-      if(n==='Hepatitis B' || n==='HBsAg (Antígeno superficie Hepatitis B)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); return; }
+-      if(n==='Brucella (Rosa de Bengala)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 4); return; }
+-      if(n==='Brucella (Wright/Tubo)' || n==='Brucella (Wright)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 6); return; }
+-      if(n==='HCG (prueba de embarazo)' || n==='Test de Embarazo') return add('pregnost');
+-      if(n==='Factor Reumatoide') return add('freumat');
+-      if(n==='ASO') return add('asto');
+-      // Reglas propias explícitas (antes caían en el genérico OTROS(4) — ya
+-      // sea con el mismo valor por coincidencia, o con un valor equivocado).
+-      // Confirmadas/propuestas en la auditoría de factores UVR (08/09/2026),
+-      // usando la misma tabla de referencia ya validada en otra instalación
+-      // SILAB, por analogía técnica con exámenes de la misma familia.
+-      if(n==='PSA'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); return; } // misma técnica inmunocromatográfica que VIH rápido/HBsAg
+-      if(n==='Hepatitis C'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); return; } // misma familia que Hepatitis B
+-      if(n==='VIH (ELISA)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 6); return; } // más laborioso que la prueba rápida (VIH=3)
+-      if(n==='Chagas'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); return; } // rápida inmunocromatográfica
+-      if(n==='VDRL'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 4); return; } // misma técnica de floculación que RPR
+-      if(n==='TASS'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 4); return; } // aglutinación, misma clase que Brucella Rosa de Bengala
+-      if(n==='Aglutinaciones'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 4); return; } // técnica de aglutinación genérica
+-      if(n==='Proteinuria cualitativa'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 2); return; } // cualitativa por tira/turbidimetría, igual que Ácido sulfosalicílico
+-      if(n==='Proteinuria 24 horas'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 5); return; } // volumen + determinación + cálculo
+-      if(n==='Proteinuria fraccionada'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 5); return; } // misma lógica que Proteinuria 24h
+-      if(n==='Albúmina urinaria'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); return; } // misma técnica que Microalbuminuria
+-      if(n==='Sangre oculta en heces'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); return; } // propuesta propia: prueba cualitativa rápida simple (no está en la tabla de referencia de la otra instalación)
+-      // cualquier otro examen del catálogo que no tenga columna propia ni factor
+-      // específico conocido va a "OTROS" con un factor genérico de reemplazo
+-      // (4), y se registra su nombre para el detalle de trazabilidad. BUG
+-      // CORREGIDO (04/09/2026): antes el conteo base recibía el factor (4) en
+-      // vez de 1 por examen.
+-      otrosNames.push(n);
+-      add('otros', 1); addUvr('otros', 4);
+-      return;
+-    });
+-    // Toma de muestra sanguínea: es una actividad aparte de los exámenes en sí
+-    // (la punción/venopunción), y se asume que quien registra el resultado es
+-    // quien tomó la muestra (ver creadoPor). Si la ficha tiene AL MENOS un
+-    // examen que requiere sangre (usa la misma clasificación de tubos que la
+-    // caja "Toma de muestra" del formulario — ver sampleKindOf/defaultSampleFor),
+-    // se suma 1 determinación en OTROS con su propio factor (5), UNA SOLA VEZ
+-    // por ficha: la punción se hace una sola vez, sin importar cuántos
+-    // exámenes de sangre se pidan de esa misma punción.
+-    const huboMuestraSanguinea = tests.some(t => sampleKindOf(defaultSampleFor(t)) === 'sangre');
+-    if(huboMuestraSanguinea){
+-      otrosNames.push('Toma de muestra sanguínea');
+-      add('otros', 1); addUvr('otros', 5);
+-    }
+-    aplicarAjusteCampana(inc, otrosNames, rec, uvr);
+-    return { inc, otrosNames, uvr };
++const inc = {}; const add=(k,n=1)=>{ inc[k]=(inc[k]||0)+n; };
++// UVR real de las columnas de factor variable (cultivo/antibiograma), aparte
++// del conteo entero de exámenes en "inc". Ver VARIABLE_FACTOR_COLS.
++const uvr = {}; const addUvr=(k,n)=>{ uvr[k]=(uvr[k]||0)+n; };
++const otrosNames = [];
++// ---- CRÉDITO DE UVR POR AUTOR (productividad) ----
++// Corrección aplicada primero en SILAB Ilave y ahora en SILAB Putina: antes
++// (computeProductivity) el UVR total de la ficha se repartía de forma
++// PROPORCIONAL a cuántos exámenes hizo cada persona en esa ficha
++// (frac = cuenta/totalTests), lo que diluía a quien hacía pocos exámenes de
++// valor alto/medio (ej. una orina completa = 5) cuando la misma ficha tenía
++// muchos ítems de hemograma. Ahora cada examen aporta su propio factor MINSA
++// real a la persona que figura como autora de ESE examen (t.performedBy /
++// t.performedById), sin diluirse por la cantidad de exámenes de la ficha.
++// `credits` es un arreglo de {actorId, actorName, factor, label} que se va
++// llenando aquí mismo, en el mismo punto donde ya se decide cada factor
++// real (add/addUvr) — así nunca puede quedar desincronizado del cuadro de
++// Informe Mensual, que sigue usando `inc`/`uvr` exactamente como antes.
++const credits = [];
++function actorOf(t){
++  return { id: t.performedById || rec.creadoPorId || '', name: t.performedBy || rec.creadoPor || '(sin asignar)' };
++}
++const pkgs = rec.packages || [];
++const tests = rec.tests || [];
++const hasHemogramaComponentes = tests.some(t=>HEMOGRAMA_COMPONENT_NAMES.includes(t.name));
++// Reconoce el nombre histórico "Hemograma Completo" (respaldos/registros
++// viejos) y las dos variantes actuales (5 y 3 diferenciales) — cualquiera
++// de las tres cuenta como UN hemograma completo.
++const hasHemograma = pkgs.some(p=>HEMOGRAMA_PKG_NAMES.includes(p)) || hasHemogramaComponentes;
++const hasWidal = pkgs.includes('Reacción de Widal');
++const hasOrinaCompleta = tests.some(t=>t.name==='Examen completo de orina');
++if(hasHemograma) add('hemograma');
++if(hasWidal){ add('widal', 1); addUvr('widal', 16); }
++// ---- Crédito del Hemograma Completo (factor fijo 12, cualquiera de los 3
++// modos: manual, 5-diferenciales o 3-diferenciales automatizado) ----
++// Se reparte SOLO entre quienes figuran como autores de los componentes del
++// hemograma que realmente están cargados en esta ficha (nunca mezclado con
++// orina, bioquímica u otros exámenes de la misma ficha). Si el mismo
++// hemograma lo cargó una sola persona (lo normal, sobre todo con equipo
++// automatizado que entra todo junto), se lleva el 12 completo.
++if(hasHemograma){
++  const hemoTests = tests.filter(t=> HEMOGRAMA_COMPONENT_NAMES.includes(t.name) || t.name==='Hemoglobina' || t.name==='Hematocrito' || t.name==='Recuento de plaquetas');
++  if(hemoTests.length){
++    const porActor = {};
++    hemoTests.forEach(t=>{
++      const a = actorOf(t); const k = a.id || `n:${a.name}`;
++      if(!porActor[k]) porActor[k] = {id:a.id, name:a.name, cuenta:0};
++      porActor[k].cuenta++;
++    });
++    const totalComp = hemoTests.length;
++    Object.values(porActor).forEach(p=>{
++      credits.push({ actorId:p.id, actorName:p.name, factor: 12*(p.cuenta/totalComp), label:'Hemograma Completo' });
++    });
++  } else {
++    // Paquete marcado pero sin componentes individuales cargados todavía
++    // (caso raro/transitorio): se acredita a quien creó la ficha.
++    credits.push({ actorId: rec.creadoPorId||'', actorName: rec.creadoPor||'(sin asignar)', factor:12, label:'Hemograma Completo' });
++  }
++}
++// ---- Crédito de la Reacción de Widal (factor fijo 16 = 4 antígenos × 4) ----
++// Mismo criterio: se reparte solo entre los autores de los antígenos de
++// Widal realmente cargados en esta ficha.
++if(hasWidal){
++  const widalTests = tests.filter(t=>(t.name||'').startsWith('Widal -'));
++  if(widalTests.length){
++    const porActor = {};
++    widalTests.forEach(t=>{
++      const a = actorOf(t); const k = a.id || `n:${a.name}`;
++      if(!porActor[k]) porActor[k] = {id:a.id, name:a.name, cuenta:0};
++      porActor[k].cuenta++;
++    });
++    const totalW = widalTests.length;
++    Object.values(porActor).forEach(p=>{
++      credits.push({ actorId:p.id, actorName:p.name, factor: 16*(p.cuenta/totalW), label:'Reacción de Widal' });
++    });
++  } else {
++    credits.push({ actorId: rec.creadoPorId||'', actorName: rec.creadoPor||'(sin asignar)', factor:16, label:'Reacción de Widal' });
++  }
++}
++tests.forEach(t=>{
++  const n = t.name;
++  const a = actorOf(t);
++  const creditT = (factor, label)=>{ if(factor) credits.push({ actorId:a.id, actorName:a.name, factor, label: label||n }); };
++  // Si aparece cualquier componente del hemograma (aunque sea uno solo), esta
++  // ficha ya se contabilizó arriba como 1 hemograma completo (diseño existente:
++  // en la práctica estos componentes solo se registran sueltos cuando en
++  // realidad se hizo el hemograma completo por partes). Su crédito de autor
++  // ya se repartió arriba, junto con el resto de componentes del hemograma.
++  if(HEMOGRAMA_COMPONENT_NAMES.includes(n)) return;
++  // Recuento de plaquetas suelto, Ácido sulfosalicílico, Microalbuminuria,
++  // VSG, TP/TTPA e INR: van dentro de la columna "OTROS" (como estaban
++  // antes, visualmente agrupados ahí), pero aportan su propio factor real
++  // de la tabla MINSA en vez del factor genérico de OTROS.
++  if(n==='Recuento de plaquetas'){ if(!hasHemograma){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); creditT(3); } return; }
++  if(n==='Cultivo y Antibiograma' || n==='Urocultivo'){
++    // Nº de exámenes realizados: SIEMPRE un conteo entero (1 cultivo por
++    // ficha — nunca una fracción ni el factor). El factor MINSA real,
++    // que sí varía según los controles de lectura cada 12 h que
++    // realmente se hicieron (ver cultivoFactorFor), se acumula aparte
++    // en "uvr" para el cuadro de determinaciones/UVR, sin mezclarse con
++    // el conteo de exámenes.
++    const cf = cultivoFactorFor(t);
++    add('cultivo', 1);
++    addUvr('cultivo', cf);
++    creditT(cf, 'Cultivo');
++    // El antibiograma solo se habilita (y se factura) cuando el cultivo
++    // salió Positivo; si es Negativo no corresponde antibiograma.
++    if(t.fields && t.fields.resultado==='Positivo'){
++      const af = antibiogramaFactorFor(t);
++      add('antibiograma', antibiogramaRoundsCount(t));
++      addUvr('antibiograma', af);
++      creditT(af, 'Antibiograma');
++    }
++    return;
++  }
++  if(n==='Baciloscopia (BK - Esputo)'||n==='Baciloscopia (BK)'||(n||'').includes('Baciloscopia')){ const c=countBkMuestras(t); add('baciloscopia', c); creditT(c*8, 'Baciloscopia (BK)'); return; }
++  if(n==='Secreción Vaginal (Gram y Directo)' || n==='Gram Directo (muestra general)' || n==='KOH (Examen Micológico Directo)'){ add('gram'); creditT(6); return; }
++  if(n==='Gota Gruesa (Metaxénicos)'){ add('metaxenicos'); creditT(9); return; }
++  if(n==='Espermatograma'){ add('espermato'); creditT(6); return; }
++  if(n==='Análisis de Líquidos (punción)'){ add('liquidos'); creditT(8); return; }
++  if(n==='Examen Directo de Heces' || n==='Parasitológico Seriado'){
++    // Cada muestra del seriado se cuenta y vale exactamente igual que un
++    // Examen Directo de Heces (mismo factor MINSA) — NO como un único
++    // examen combinado — porque son muestras de días distintos, cada una
++    // con sus propias características: 1 muestra = 1 examen, 2 muestras =
++    // 2 exámenes, 3 muestras = 3 exámenes. El Examen Directo (una sola
++    // muestra) siempre cuenta como 1. La reacción inflamatoria
++    // (leucocitos/moco en heces) se realiza junto con el parasitológico
++    // sobre la misma muestra, así que se contabiliza igual, veces por veces.
++    const veces = n==='Parasitológico Seriado' ? countSeriadoMuestras(t) : 1;
++    add('parasitolog', veces); addUvr('parasitolog', veces*6);
++    add('rinflam', veces);
++    creditT(veces*6, n);
++    creditT(veces*5, 'Reacción inflamatoria (seriado)');
++    return;
++  }
++  if(n==='Reacción inflamatoria en heces'){ add('rinflam'); creditT(5); return; } // a veces se pide solo esta, sin el parasitológico
++  if(n==='Test de Graham (cinta adhesiva - Enterobius vermicularis)'){
++    // Factor MINSA real del Test de Graham: 5 (catálogo oficial), distinto
++    // del factor de PARASITOLOG. (6) con el que comparte columna en el
++    // cuadro base — por eso se acumula aparte con addUvr en vez de dejar
++    // que el factor genérico de la columna (6) lo calcule por sí solo.
++    // Igual que el Seriado, cada muestra (I/II/III) cuenta y vale como
++    // examen aparte. Sin reacción inflamatoria, que no aplica a esta
++    // muestra (no es heces).
++    const veces = countSeriadoMuestras(t);
++    add('parasitolog', veces); addUvr('parasitolog', veces*5);
++    creditT(veces*5, 'Test de Graham');
++    return;
++  }
++  if(n==='Examen completo de orina'){
++    // El sedimento urinario se hace siempre junto con el examen completo
++    // de orina, sobre la misma muestra: se contabilizan ambos.
++    add('orinas'); add('sedimento');
++    creditT(5, 'Examen completo de orina');
++    creditT(3, 'Sedimento urinario (junto a orina)');
++    return;
++  }
++  if(n==='Sedimento urinario'){ if(!hasOrinaCompleta){ add('sedimento'); creditT(3); } return; }
++  if(n==='Ácido sulfosalicílico (proteínas orina)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 2); creditT(2); return; }
++  if(n==='Microalbuminuria'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); creditT(3); return; }
++  if(n==='Hematocrito' || n==='Hemoglobina'){ if(!hasHemograma){ add('htohb'); creditT(3); } return; }
++  if(n==='Grupo sanguíneo' || n==='Factor RH'){ add('grupo'); creditT(3); return; }
++  if(n==='VSG'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 5); creditT(5); return; }
++  if(n==='Tiempo de Coagulación' || n==='Tiempo de Sangría'){ add('coagsangria'); creditT(5); return; }
++  if(n==='Tiempo de Protrombina' || n==='Tiempo de Tromboplastina Parcial' || n==='Tiempo de Trombina'){ otrosNames.push(n); add('otros', 1); addUvr('otros', OTROS_FACTOR_TP_TTPA); creditT(OTROS_FACTOR_TP_TTPA); return; }
++  if(n==='INR'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 1); creditT(1); return; }
++  // PCR: cuantitativo (bioq) y cualitativo (inmuno) → columna P.C.R.
++  if(n==='PCR cuantitativo' || n==='Proteína C Reactiva'){ add('pcr'); creditT(3); return; } // valores numéricos (bioquímica)
++  if(n==='PCR cualitativo'){ add('pcr_cual'); creditT(4); return; } // Negativo / + / ++ / +++ (inmunoserología)
++  if(n==='Test de Sullivan (PTOG 50 g)'){ add('bioquimica'); creditT(colFactor('bioquimica')); return; } // tamizaje: 1 sola determinación (glucosa a la 1h)
++  if(n==='Prueba de Tolerancia Oral a la Glucosa (PTOG)'){ const c=countPtogDeterminaciones(t); add('bioquimica', c); creditT(c*colFactor('bioquimica')); return; } // cada determinación de glucosa cargada (ayunas/1h/2h/3h) es un examen bioquímico aparte
++  if(t.area==='Bioquímica Clínica'){ add('bioquimica'); creditT(colFactor('bioquimica')); return; }
++  if(n==='RPR'){ const c=rprDeterminaciones(t); add('rpr', c); creditT(c*4); return; }
++  if(n==='Sífilis (Prueba rápida)'){ add('sifilis_rapida'); creditT(3); return; }
++  if(n.startsWith('Widal -')){ if(!hasWidal){ add('widal', 1); addUvr('widal', 4); creditT(4); } return; } // sin paquete: cada antígeno suelto aporta su propio factor (4); ya acreditado arriba si hay paquete
++  if(n==='VIH'){ add('vih'); creditT(3); return; }
++  if(n==='Hepatitis B' || n==='HBsAg (Antígeno superficie Hepatitis B)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); creditT(3); return; }
++  if(n==='Brucella (Rosa de Bengala)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 4); creditT(4); return; }
++  if(n==='Brucella (Wright/Tubo)' || n==='Brucella (Wright)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 6); creditT(6); return; }
++  if(n==='HCG (prueba de embarazo)' || n==='Test de Embarazo'){ add('pregnost'); creditT(3); return; }
++  if(n==='Factor Reumatoide'){ add('freumat'); creditT(4); return; }
++  if(n==='ASO'){ add('asto'); creditT(4); return; }
++  // ---- Factores investigados y confirmados por analogía técnica con la
++  // tabla MINSA (ver conversación de asignación de factores UVR) ----
++  // Pruebas rápidas inmunocromatográficas: misma técnica que VIH
++  // rápido/HBsAg (factor 3).
++  if(n==='PSA'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); creditT(3); return; }
++  if(n==='Hepatitis C'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); creditT(3); return; }
++  if(n==='Hepatitis A (Prueba rápida IgM)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); creditT(3); return; }
++  if(n==='Helicobacter pylori (Anticuerpo IgG en suero)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); creditT(3); return; }
++  if(n==='Chagas'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); creditT(3); return; }
++  // Floculación no treponémica / aglutinación: misma técnica que RPR (4) y
++  // Brucella Rosa de Bengala (4).
++  if(n==='VDRL'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 4); creditT(4); return; }
++  if(n==='TASS'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 4); creditT(4); return; }
++  if(n==='Aglutinaciones'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 4); creditT(4); return; }
++  // ELISA: más laborioso que una prueba rápida, equiparado a Gram/Directo (6).
++  if(n==='VIH (ELISA)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 6); creditT(6); return; }
++  // Proteinurias: cualitativa por tira/turbidimetría, igual que Ácido
++  // sulfosalicílico (2). Las cuantitativas con recolección de orina (24h
++  // y fraccionada) exigen medir volumen + determinar concentración +
++  // calcular el resultado — mismo nivel de trabajo manual que VSG/
++  // Coagulación (5), criterio confirmado con el usuario.
++  if(n==='Proteinuria cualitativa'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 2); creditT(2); return; }
++  if(n==='Proteinuria 24 horas'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 5); creditT(5); return; }
++  if(n==='Proteinuria fraccionada'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 5); creditT(5); return; }
++  if(n==='Albúmina urinaria'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 3); creditT(3); return; }
++  // Coprofuncional: base física/microscópica igual que el Parasitológico/
++  // Examen Directo de Heces (6) + azúcares reductores por Benedict (2) +
++  // grasas por Sudán III (2) = 10. Criterio confirmado con el usuario
++  // (debía quedar igual o por encima del Parasitológico).
++  if(n==='Examen Coprofuncional'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 10); creditT(10); return; }
++  // Frotis con tinción y lectura microscópica, igual que Gram/Directo (6).
++  if(n==='Frotis para Leishmania'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 6); creditT(6); return; }
++  // Determinación manual + cadena de custodia legal, equiparado a VSG/
++  // Coagulación manual (5).
++  if(n==='Dosaje Etílico (Alcoholemia)'){ otrosNames.push(n); add('otros', 1); addUvr('otros', 5); creditT(5); return; }
++  // cualquier otro examen del catálogo que no tenga columna propia ni factor
++  // específico conocido va a "OTROS" con un factor genérico de reemplazo
++  // (4), y se registra su nombre para el detalle de trazabilidad. BUG
++  // CORREGIDO (04/09/2026): antes el conteo base recibía el factor (4) en
++  // vez de 1 por examen.
++  otrosNames.push(n);
++  add('otros', 1); addUvr('otros', 4);
++  creditT(4);
++  return;
++});
++// Toma de muestra sanguínea: es una actividad aparte de los exámenes en sí
++// (la punción/venopunción), y se asume que quien registra el resultado es
++// quien tomó la muestra (ver creadoPor). Si la ficha tiene AL MENOS un
++// examen que requiere sangre (usa la misma clasificación de tubos que la
++// caja "Toma de muestra" del formulario — ver sampleKindOf/defaultSampleFor),
++// se suma 1 determinación en OTROS con su propio factor (5), UNA SOLA VEZ
++// por ficha: la punción se hace una sola vez, sin importar cuántos
++// exámenes de sangre se pidan de esa misma punción.
++const huboMuestraSanguinea = tests.some(t => sampleKindOf(defaultSampleFor(t)) === 'sangre');
++if(huboMuestraSanguinea){
++  otrosNames.push('Toma de muestra sanguínea');
++  add('otros', 1); addUvr('otros', 5);
++  credits.push({ actorId: rec.creadoPorId||'', actorName: rec.creadoPor||'(sin asignar)', factor:5, label:'Toma de muestra sanguínea' });
++}
++aplicarAjusteCampana(inc, otrosNames, rec, uvr);
++// El ajuste por campaña de salud masiva también se refleja en el crédito
++// por autor, para que el total de UVR de productividad no se desalinee
++// del Informe Mensual cuando hay fichas de campaña.
++if(rec.esCampanaSalud && campanaConfig.multiplicador > 1){
++  credits.forEach(c=>{ c.factor = c.factor * campanaConfig.multiplicador; });
++  credits.push({ actorId: rec.creadoPorId||'', actorName: rec.creadoPor||'(sin asignar)', factor: campanaConfig.preanalitica, label:'Fase preanalítica masiva (campaña)' });
++}
++return { inc, otrosNames, uvr, credits };
+   }
+ 
++
+   function parseFechaMes(fecha){
+     // fecha viene como dd/mm/aaaa (texto libre digitado en la ficha), pero las
+     // fichas importadas en bloque desde Excel a veces llegan como d/m/aa (año
