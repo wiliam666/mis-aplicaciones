@@ -24,6 +24,18 @@
       navigator.serviceWorker.register('./sw.js').catch(()=>{ /* si no existe sw.js en el hosting, la app sigue funcionando normalmente */ });
     });
   }
+
+  // Reporte en consola de la auditoría de rendimiento/bugs (06/11/2026)
+  console.info(
+    '%c[Auditoría SILAB OS Putina — 06/11/2026]%c\n' +
+    '• CAUSA de la lentitud al guardar: cada guardado disparaba 2-3 snapshots de Firestore (eco local + confirmación) que reconstruían TODA la colección, reescribían el historial completo a IndexedDB (JSON.stringify) y redibujaban todo (renderAll). Ahora los ecos propios se descartan por huella (fingerprintRecords) y lo pesado se coalesce.\n' +
+    '• nextLabCode ya no congela el guardado con red lenta (tope de 8 s antes de caer al correlativo local).\n' +
+    '• getPatients y la completitud por ficha van memoizados por versión de records: renderAll ya no hace 4-5 recorridos completos.\n' +
+    '• Autoguardado: no encadena escrituras solapadas (guard autoSaveInFlight) y el estatus solo aparece cuando en verdad guarda.\n' +
+    '• Bugs corregidos: fuga de recordCompletionSeen, TypeError por examen ausente en la hoja, promesa colgada en handleSave, historial obsoleto tras guardar, reintento en bucle de la reparación createdAt.\n' +
+    '• Detalle completo: REPORTE-AUDITORIA-' + 'Putina'.toLowerCase() + '.md',
+    'color:#0e7c86;font-weight:bold;','color:inherit;font-weight:normal;'
+  );
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
@@ -1278,7 +1290,7 @@
 })();
 
   const storage = window.__labStorage;
-  const APP_VERSION = '1.0.0 · 30-sep-2026';
+  const APP_VERSION = '1.0.1 · 09-nov-2026';
   const STORAGE_KEY = 'lab:records';
 
   // <<< PLATAFORMA_COMPLEMENTOS_INICIO >>>
@@ -1865,6 +1877,54 @@
     }
   }
 
+  // ═══ OPTIMIZACIÓN: frenar el "remolino" de snapshots al guardar ═══
+  // Firestore dispara el listener de 'resultados' con cada escritura del
+  // propio equipo — con cambios de metadata activados llega 2+ veces por
+  // guardado (eco local al encolar la escritura y confirmación del
+  // servidor). Antes, CADA disparo volvía a reconstruir TODA la colección,
+  // reescribía todo el historial a IndexedDB (JSON.stringify completo) y
+  // disparaba un renderAll completo: por eso el guardado se sentía
+  // congelado. Con estas utilidades el eco del propio guardado se descarta
+  // al vuelo y lo pesado se coalesce.
+  function hashStr(s){
+    let h = 5381;
+    for(let i=0;i<s.length;i++){ h = (((h<<5)+h) + s.charCodeAt(i))|0; }
+    return h;
+  }
+  // Huella barata (no serializa contenido): ids + marcas de modificación +
+  // versión + estado + nº de pruebas. La suma de hashes la hace insensible
+  // al orden de los documentos, para que el eco del propio guardado
+  // coincida aun si Firestore devuelve otra secuencia.
+  function fingerprintRecords(list){
+    let h = 0;
+    for(let i=0;i<list.length;i++){
+      const r = list[i];
+      const s = (r.id||'')+'~'+(r.modificadoEn||0)+'~'+(r.version||1)+'~'+(r.status||'')+'~'+((r.tests||[]).length)+'~'+(r.createdAt||0);
+      h = (h + hashStr(s))|0;
+    }
+    return list.length + ':' + h;
+  }
+  let __cloudFinger = null; // huella de lo último que se aplicó desde la nube
+  const __reparadosCreatedAt = new Set(); // ids ya reparados en esta sesión (evita reintentos en bucle si la nube no responde)
+  let cloudRenderTimer = null;
+  function scheduleCloudRenderAll(){
+    // OPTIMIZACIÓN: si llegan varios snapshots seguidos (carga inicial a
+    // trozos, varios departamentos editando), se dibuja UNA sola vez.
+    if(cloudRenderTimer) return; // ya hay uno pendiente: no lo empujamos más
+    cloudRenderTimer = setTimeout(()=>{ cloudRenderTimer = null; renderAll(); }, 150);
+  }
+  let cloudPersistTimer = null;
+  function scheduleCloudPersist(){
+    // OPTIMIZACIÓN: la persistencia local del historial completo
+    // (JSON.stringify de TODAS las fichas) se coalesce: si llegan snapshots
+    // casi seguidos, solo se escribe el estado final, no cada paso.
+    if(cloudPersistTimer) return;
+    cloudPersistTimer = setTimeout(()=>{
+      cloudPersistTimer = null;
+      storage.set(STORAGE_KEY, JSON.stringify(records));
+    }, 400);
+  }
+
   async function initCloudSync(){
     setCloudStatus('connecting');
     const ok = await waitForFirebaseBridge(5000);
@@ -1881,6 +1941,16 @@
     try{
       const resultadosCol = fb.collection(fb.db, 'resultados');
       unsubRecords = fb.onSnapshot(resultadosCol, {includeMetadataChanges:true}, (snap)=>{
+        // snap.metadata.hasPendingWrites: hay cambios hechos en este equipo que
+        // todavía no se confirman en el servidor (típico mientras no hay internet).
+        // snap.metadata.fromCache: los datos que se están mostrando vienen de la
+        // copia local, no del servidor (también pasa sin internet).
+        // OPTIMIZACIÓN: el estado del indicador se actualiza SIEMPRE, incluso
+        // si luego el snapshot se descarta por ser solo el eco de este equipo.
+        if(navigator.onLine === false){ setCloudStatus('local'); }
+        else if(snap.metadata.hasPendingWrites){ setCloudStatus('pending'); }
+        else if(!snap.metadata.fromCache){ setCloudStatus('online'); }
+
         const incomingRecords = snap.docs.map(d=>({...d.data(), id:d.id}));
         // Misma protección que para usuarios: si la nube devuelve la lista vacía
         // pero este equipo ya tenía fichas guardadas, no se borran (evita una
@@ -1889,30 +1959,33 @@
           console.warn('Sincronización de resultados vacía ignorada para no borrar las fichas ya guardadas en este equipo.');
           return;
         }
+        // OPTIMIZACIÓN (CAUSA PRINCIPAL DE LA LENTITUD AL GUARDAR): si la
+        // huella de lo que llega coincide con lo ya mostrado, este snapshot
+        // es solo el eco del propio guardado — no hay nada nuevo que
+        // construir, guardar ni dibujar. Antes esto se ejecutaba completo 2-3
+        // veces por cada "Guardar registro".
+        const huella = fingerprintRecords(incomingRecords);
+        if(huella === __cloudFinger) return;
+        __cloudFinger = huella;
+
         recordsKernel.replaceAll(incomingRecords);
         sincronizarRecords();
         records.forEach(migrateLegacy);
         records.forEach(r=>{
-          if(!r.createdAt){
+          if(!r.createdAt && !__reparadosCreatedAt.has(r.id)){
+            __reparadosCreatedAt.add(r.id);
             r.createdAt = Date.now(); // reparación: registros antiguos sin fecha de creación
             cloudSetRecord(r); // se corrige también en la nube para que no vuelva a faltar
           }
         });
         recordsKernel.sortByCreatedDesc();
         sincronizarRecords();
-        storage.set(STORAGE_KEY, JSON.stringify(records));
+        scheduleCloudPersist(); // OPTIMIZACIÓN: persistencia local coalescida
         if(editingId){
           const editedRec = records.find(r=>r.id===editingId);
           if(editedRec) checkExternalEdit(editedRec);
         }
-        // snap.metadata.hasPendingWrites: hay cambios hechos en este equipo que
-        // todavía no se confirman en el servidor (típico mientras no hay internet).
-        // snap.metadata.fromCache: los datos que se están mostrando vienen de la
-        // copia local, no del servidor (también pasa sin internet).
-        if(navigator.onLine === false){ setCloudStatus('local'); }
-        else if(snap.metadata.hasPendingWrites){ setCloudStatus('pending'); }
-        else if(!snap.metadata.fromCache){ setCloudStatus('online'); }
-        renderAll();
+        scheduleCloudRenderAll(); // OPTIMIZACIÓN: un solo renderAll por ráfaga de snapshots
       }, (err)=>{ console.error('sync resultados', err); setCloudStatus('local'); });
 
       // Base de datos SIS: NO se sincroniza en tiempo real (son miles de pacientes y casi no cambian).
@@ -2267,7 +2340,7 @@
       {name:"VIH (ELISA)", unit:"", ref:"No reactivo", options:["","No reactivo","Reactivo","Indeterminado"]},
       {name:"RPR", unit:"", ref:"No reactivo", options:["","No reactivo","Reactivo"]},
       {name:"Sífilis (Prueba rápida)", unit:"", ref:"No reactivo", options:["","No reactivo","Reactivo"]},
-      {name:"PCR cualitativo", unit:"", ref:"Negativo / + / ++ / +++", options:["","Negativo","+","++","+++"]},
+      {name:"PCR cualitativo", unit:"", ref:"Negativo / Positivo (+/++/+++)", options:["","Negativo","Positivo (+)","Positivo (++)","Positivo (+++)"]},
       {name:"Chagas", unit:"", ref:"", options:["","No reactivo","Reactivo"]},
       {name:"VDRL", unit:"", ref:"", options:["","No reactivo","Reactivo"]},
       {name:"HCG (prueba de embarazo)", unit:"", ref:"", options:["","Negativo","Positivo"]},
@@ -2294,7 +2367,7 @@
       {name:"Examen Directo de Heces", unit:"", ref:"", structured:"parasito_directo"},
       {name:"Parasitológico Seriado", unit:"", ref:"", structured:"parasito_seriado"},
       {name:"Sangre oculta en heces", unit:"", ref:"", options:["","Negativo","Positivo"]},
-      {name:"Reacción inflamatoria en heces", unit:"", ref:""},
+      {name:"Reacción inflamatoria en heces", unit:"", ref:"", structured:"rinflam"},
       {name:"Examen Coprofuncional", unit:"", ref:"", structured:"coprofuncional"},
       {name:"Test de Graham (cinta adhesiva - Enterobius vermicularis)", unit:"", ref:"", structured:"graham"}
     ],
@@ -2836,6 +2909,29 @@
           {key:'observaciones', label:'Observaciones', textarea:true}
         ]}
       ]
+    },
+    // Reforma normativa MINSA/INS: la reacción inflamatoria en heces ya no se
+    // captura como texto simple (Positivo/Negativo) — se cuantifica por campo
+    // microscópico 40X, se diferencia PMN/MN y se registra la presencia de
+    // hematíes (mismo criterio que espermatograma/liquidos).
+    rinflam: {
+      label: 'Reacción inflamatoria en heces',
+      groups: [
+        {title:'Cuantificación de Leucocitos (Campo 40X)', fields:[
+          {key:'leucocitos_min', label:'Leucocitos mínimo por campo', unit:'cél/campo'},
+          {key:'leucocitos_max', label:'Leucocitos máximo por campo', unit:'cél/campo'}
+        ]},
+        {title:'Diferenciación Celular (Morfología)', fields:[
+          {key:'pmn_porcentaje', label:'Polimorfonucleares (PMN)', unit:'%', ref:'Predominio en infecciones bacterianas'},
+          {key:'mn_porcentaje', label:'Mononucleares (MN)', unit:'%', ref:'Asociados a procesos virales'}
+        ]},
+        {title:'Presencia de Hematíes', fields:[
+          {key:'hematies', label:'Hematíes (Glóbulos rojos)', type:'select', options:['','No se observan', 'Escasos', 'Moderados', 'Abundantes']}
+        ]},
+        {title:'Observaciones', fields:[
+          {key:'observaciones', label:'Observaciones adicionales', textarea:true}
+        ]}
+      ]
     }
   };
 
@@ -3251,11 +3347,24 @@
   // Único lugar autorizado a escribir la variable global de fichas.
   // ids que ya se habían visto, para poder distinguir un alta de un simple
   // resincronizado. No se guarda el contenido: solo los ids.
+  // OPTIMIZACIÓN: contador de versión de las fichas. Sube en cada mutación
+  // autorizada (y también en saveRecords, ver abajo) para invalidar de un
+  // golpe los cálculos derivados que antes se repetían en cada guardado:
+  // getPatients() y el mapa de completitud de renderStats/
+  // checkCompletionTransitions/patientHasPending. Sin esto, un solo
+  // "Guardar" disparaba 4-5 recorridos completos a la vez. La construcción
+  // con "typeof" deja a sincronizarRecords() como bloque autocontenido (la
+  // suite de paridad la evalúa sola, sin las declaraciones vecinas).
+  // BUG CORREGIDO (auditoría): estas dos declaraciones se perdieron al
+  // reemplazar sincronizarRecords(); sin ellas la primera sincronización
+  // reventaba con "__idsVistos is not defined".
   let __idsVistos = new Set();
   let __primerSync = true;
+  let __recordsVersion = 0;
   function sincronizarRecords(){
     const todos = recordsKernel.all;
     records = todos;
+    __recordsVersion = (typeof __recordsVersion === 'number' ? __recordsVersion : 0) + 1;
     // ── Aviso al bus de complementos ──
     // Toda mutación de resultados pasa por acá (es el único punto donde se
     // recalcula la lista global), así que este es el lugar honesto para
@@ -3556,6 +3665,12 @@
     records.forEach(migrateLegacy);
   }
   async function saveRecords(){
+    // OPTIMIZACIÓN: toda mutación de fichas termina llamando a saveRecords()
+    // (handleSave, autoguardado, anular, corregir, liberar, importar...).
+    // Marcar la versión acá garantiza que las cachés derivadas (pacientes y
+    // completitud) no devuelvan datos viejos ni siquiera si la mutación fue
+    // "in place" sobre un registro sin pasar por recordsKernel.
+    __recordsVersion = (typeof __recordsVersion === 'number' ? __recordsVersion : 0) + 1;
     try{ await storage.set(STORAGE_KEY, JSON.stringify(records)); }
     catch(e){ toast('No se pudo guardar. Intenta de nuevo.'); console.error(e); }
   }
@@ -3603,7 +3718,7 @@
     return new Date().toLocaleDateString('es-PE', {day:'2-digit', month:'2-digit', year:'numeric'});
   }
 
-  function getPatients(){
+  function getPatientsCompute(){
     const map = new Map();
     records.forEach(r=>{
       const key = patientKeyOf(r);
@@ -3615,16 +3730,44 @@
     // hoy/últimamente aparecen primero.
     return Array.from(map.values()).sort((a,b)=> recordSortTime(b.records[0]) - recordSortTime(a.records[0]));
   }
+  // OPTIMIZACIÓN (cuello de botella en guardar): getPatients() se llamaba en
+  // CADA renderizado sin caché — renderStats, renderPatientList y
+  // renderHistory la invocaban una vez cada uno dentro de un mismo renderAll,
+  // y cada llamada reconstruía el Map de pacientes y reordenaba TODAS las
+  // fichas (incluye parsear la fecha de atención con regex en cada
+  // comparación del sort). Ahora el resultado se memoiza por versión de
+  // records; la marca se invalida en sincronizarRecords() y en saveRecords()
+  // (ver abajo), y todo flujo que muta fichas pasa por uno de los dos.
+  let __patientsCache = { version:-1, lista:null };
+  function getPatients(){
+    if(__patientsCache.version===__recordsVersion && __patientsCache.lista) return __patientsCache.lista;
+    __patientsCache = { version:__recordsVersion, lista:getPatientsCompute() };
+    return __patientsCache.lista;
+  }
+  // OPTIMIZACIÓN: la completitud por ficha (computeRecordCompletion) se
+  // calculaba en varios recorridos completos dentro del mismo renderAll
+  // (renderStats, checkCompletionTransitions, patientHasPending, panel de
+  // pendientes). Se memoiza una vez por versión de records para que cada
+  // guardado haga una sola pasada en lugar de hasta 4.
+  let __completionsCache = { version:-1, mapa:null };
+  function getCompletionMap(){
+    if(__completionsCache.version===__recordsVersion && __completionsCache.mapa) return __completionsCache.mapa;
+    const mapa = new Map();
+    records.forEach(r=>{ mapa.set(r.id, computeRecordCompletion(r)); });
+    __completionsCache = { version:__recordsVersion, mapa };
+    return __completionsCache.mapa;
+  }
 
   function renderStats(){
     const patients = getPatients();
     $('statPatients').textContent = patients.length;
     $('statRecords').textContent = records.length;
     const vt = $('appVersionTag'); if(vt) vt.textContent = 'v'+APP_VERSION;
-    const pendingCount = records.filter(r=>{
-      const c = computeRecordCompletion(r);
-      return !c.empty && !c.complete;
-    }).length;
+    // OPTIMIZACIÓN: una sola pasada con el mapa de completitud memoizado,
+    // antes era records.filter(...) recalculando computeRecordCompletion de
+    // todas las fichas en cada renderizado.
+    let pendingCount = 0;
+    getCompletionMap().forEach(c=>{ if(!c.empty && !c.complete) pendingCount++; });
     const badge = $('pendingBadge');
     if(badge){
       if(pendingCount>0){ badge.textContent = pendingCount>99?'99+':String(pendingCount); badge.style.display = 'flex'; }
@@ -3663,15 +3806,23 @@
 
   let recordCompletionSeen = new Map(); // id de registro -> ¿estaba completo? (última vez visto)
   function checkCompletionTransitions(){
+    // OPTIMIZACIÓN: usa el mapa memoizado de completitud en vez de recorrer
+    // TODAS las fichas y todas sus pruebas de nuevo (ya se hizo en renderStats
+    // del mismo renderAll). Además se reemplaza el Map completo cada ronda:
+    // antes los ids de fichas eliminadas se quedaban para siempre (fuga de
+    // memoria menor que crecía sin parar en dispositivos viejos).
+    const completions = getCompletionMap();
+    const prevMap = recordCompletionSeen;
+    const nuevo = new Map();
     records.forEach(r=>{
-      const c = computeRecordCompletion(r);
+      const c = completions.get(r.id) || computeRecordCompletion(r);
       if(c.empty) return;
-      const prev = recordCompletionSeen.get(r.id);
-      if(prev===false && c.complete){
+      if(prevMap.get(r.id)===false && c.complete){
         toast(`✅ ${r.nombre||'Paciente'}: se completaron todos los exámenes. Ya se puede imprimir.`);
       }
-      recordCompletionSeen.set(r.id, c.complete);
+      nuevo.set(r.id, c.complete);
     });
+    recordCompletionSeen = nuevo;
   }
 
   function renderPendingPanel(){
@@ -3683,27 +3834,29 @@
     // complete. Los ya COMPLETOS solo se muestran mientras sean de HOY (quedan visibles el
     // resto del día como confirmación de que ya se puede imprimir); si son de un día anterior,
     // desaparecen de esta lista en cuanto se completan.
-    const relevant = records.filter(r=>{
-      const c = computeRecordCompletion(r);
+    // OPTIMIZACIÓN: la completitud se calcula UNA vez por ficha (con el mapa
+    // memoizado). Antes se llamaba dentro del comparador del sort (hasta 2
+    // veces por comparación: O(N log N) recálculos) y de nuevo en cada item.
+    const completions = getCompletionMap();
+    const relevant = records.map(r=>({r, c: completions.get(r.id) || computeRecordCompletion(r)})).filter(({r, c})=>{
       if(c.empty) return false;
       if(!c.complete) return true;
       return (r.fecha||'').trim()===today;
     });
     relevant.sort((a,b)=>{
-      const ca = computeRecordCompletion(a).complete, cb = computeRecordCompletion(b).complete;
+      const ca = a.c.complete, cb = b.c.complete;
       if(ca!==cb) return ca?1:-1;
-      if(!ca) return recordSortTime(b)-recordSortTime(a); // entre pendientes: los más antiguos primero, para no perderlos de vista
-      return (b.createdAt||0)-(a.createdAt||0);
+      if(!ca) return recordSortTime(b.r)-recordSortTime(a.r); // entre pendientes: los más antiguos primero, para no perderlos de vista
+      return (b.r.createdAt||0)-(a.r.createdAt||0);
     });
-    const pendingN = relevant.filter(r=>!computeRecordCompletion(r).complete).length;
+    const pendingN = relevant.filter(({c})=>!c.complete).length;
     const doneTodayN = relevant.length - pendingN;
     $('pendingCountSub').textContent = `${pendingN} pendiente${pendingN===1?'':'s'} (de cualquier día) · ${doneTodayN} completado${doneTodayN===1?'':'s'} hoy`;
     if(!relevant.length){
       listEl.innerHTML = `<div class="empty-note" style="padding:14px 4px;">No hay pacientes con exámenes pendientes. 🎉</div>`;
       return;
     }
-    listEl.innerHTML = relevant.map(r=>{
-      const c = computeRecordCompletion(r);
+    listEl.innerHTML = relevant.map(({r, c})=>{
       const chips = c.areas.map(a=>`<span class="pend-chip ${a.complete?'ok':'pending'}">${a.complete?'✓':'⏳'} ${escapeHtml(a.area)}${a.complete?'':` ${a.filled}/${a.total}`}</span>`).join('');
       return `<li class="pend-item ${c.complete?'ok':'pending'}" data-openrecord="${escapeHtml(r.id)}">
         <div class="pend-dot ${c.complete?'ok':'pending'}"></div>
@@ -3877,8 +4030,11 @@
 
   let patientListFilter = 'all'; // all | today | pending
   function patientHasPending(p){
+    // OPTIMIZACIÓN: usa el mapa memoizado de completitud en vez de recalcar
+    // computeRecordCompletion por cada ficha de cada paciente en cada render.
+    const completions = getCompletionMap();
     return (p.records||[]).some(r=>{
-      const c = computeRecordCompletion(r);
+      const c = completions.get(r.id) || computeRecordCompletion(r);
       return !c.empty && !c.complete;
     });
   }
@@ -4458,13 +4614,19 @@
     if(cloudReady && fb && fb.runTransaction){
       try{
         const ref = fb.doc(fb.db, 'config', LAB_CODE_COUNTER_PREFIX + key);
-        const seq = await fb.runTransaction(fb.db, async (tx)=>{
+        // OPTIMIZACIÓN (guardar lento): sin internet o con red muy lenta, la
+        // transacción de Firestore se puede quedar esperando varios segundos
+        // (reintentos internos con backoff) ANTES de caer al modo local, y
+        // como handleSave la espera para terminar, el guardado quedaba
+        // congelado. Con un tope de 8 s se usa el correlativo local con
+        // sufijo de dispositivo igual que cuando la transacción falla.
+        const seq = await withTimeout(fb.runTransaction(fb.db, async (tx)=>{
           const snap = await tx.get(ref);
           const current = snap.exists() ? (snap.data().seq||0) : 0;
           const next = current + 1;
           tx.set(ref, {seq: next, fecha: `${dd}/${mm}/${yy}`});
           return next;
-        });
+        }), 8000, 'correlativo de código de laboratorio');
         try{ await storage.set(LAB_CODE_SEQ_KEY, JSON.stringify({key, seq})); }catch(e){}
         return prefix + String(seq).padStart(4,'0');
       }catch(e){
@@ -5652,8 +5814,12 @@
     wrap.querySelectorAll('input[data-name], select[data-name]').forEach(inp=>{
       inp.addEventListener('input', ()=>{
         const t = currentTests.find(x=>x.name===inp.getAttribute('data-name'));
-        if(t) t.value = inp.value;
-        const ev = t ? evaluateValue(t.name, t.ref, t.value, $('f_sexo').value) : null;
+        // BUG CORREGIDO: si el examen ya no está en currentTests (ej. quedó un
+        // input de un render anterior con un nombre repetido), t es undefined
+        // y abajo CSS.escape(t.name) lanzaba TypeError. Se sale en silencio.
+        if(!t) return;
+        t.value = inp.value;
+        const ev = evaluateValue(t.name, t.ref, t.value, $('f_sexo').value);
         inp.classList.remove('flagged-low','flagged-high','flagged-critical');
         if(ev){
           if(ev.critical) inp.classList.add('flagged-critical');
@@ -5662,7 +5828,7 @@
         }
         const flagSpan = wrap.querySelector(`.si-flag[data-flagfor="${CSS.escape(t.name)}"]`);
         if(flagSpan) flagSpan.innerHTML = flagBadgeHTML(ev);
-        if(t && t.name==='RPR'){
+        if(t.name==='RPR'){
           const advDiv = wrap.querySelector(`.si-rpr-adv[data-advfor="${CSS.escape(t.name)}"]`);
           if(advDiv){
             const advText = rprAdvisoryText(t.value);
@@ -5947,52 +6113,61 @@
     return true;
   }
   async function handleSave(){
-    const nombre = $('f_nombre').value.trim();
-    if(!nombre){ toast('El nombre del paciente es obligatorio.'); $('f_nombre').focus(); return; }
-    const servicioVal = $('f_servicio').value.trim();
-    if(!servicioVal){ toast('Debes seleccionar el Servicio antes de continuar.'); $('f_servicio').focus(); return; }
-    if(!validateFechaAtencion()){ toast('Revisa la fecha de atención (dd/mm/aaaa).'); $('f_fecha').focus(); return; }
-    validateDniField(); // aviso visual, no bloquea (puede ser CE / pasaporte)
-    const u = currentUser();
-    if(!u){ toast('Selecciona quién está registrando este resultado (arriba, en "Atendido / registrado por").'); return; }
-    if(u.passwordHash && verifiedUserId!==u.id){ await onUserSelected(); toast('Confirma tu contraseña para continuar.'); return; }
-    if(!canSaveResults(u)){ toast(`Tu usuario tiene rol "Solo lectura" y no puede guardar resultados.`); return; }
-    const existingCheck = editingId ? records.find(r=>r.id===editingId) : null;
-    if(existingCheck && ['released','corrected','void'].includes(existingCheck.status)){
-      toast('Este resultado ya fue entregado/liberado. Para modificarlo usa el botón "🔁 Corregir" en su ficha, dentro del historial del paciente.');
-      return;
+    // ROBUSTEZ: handleSave es async y se usa como listener de click directo;
+    // sin try/catch cualquier rechazo interno (IndexedDB ocupado, red, etc.)
+    // quedaba como promesa colgada invisible y la ficha se quedaba a medias.
+    try{
+      const nombre = $('f_nombre').value.trim();
+      if(!nombre){ toast('El nombre del paciente es obligatorio.'); $('f_nombre').focus(); return; }
+      const servicioVal = $('f_servicio').value.trim();
+      if(!servicioVal){ toast('Debes seleccionar el Servicio antes de continuar.'); $('f_servicio').focus(); return; }
+      if(!validateFechaAtencion()){ toast('Revisa la fecha de atención (dd/mm/aaaa).'); $('f_fecha').focus(); return; }
+      validateDniField(); // aviso visual, no bloquea (puede ser CE / pasaporte)
+      const u = currentUser();
+      if(!u){ toast('Selecciona quién está registrando este resultado (arriba, en "Atendido / registrado por").'); return; }
+      if(u.passwordHash && verifiedUserId!==u.id){ await onUserSelected(); toast('Confirma tu contraseña para continuar.'); return; }
+      if(!canSaveResults(u)){ toast(`Tu usuario tiene rol "Solo lectura" y no puede guardar resultados.`); return; }
+      const existingCheck = editingId ? records.find(r=>r.id===editingId) : null;
+      if(existingCheck && ['released','corrected','void'].includes(existingCheck.status)){
+        toast('Este resultado ya fue entregado/liberado. Para modificarlo usa el botón "🔁 Corregir" en su ficha, dentro del historial del paciente.');
+        return;
+      }
+      if(currentTests.length===0 && !confirm('La hoja no tiene exámenes. ¿Crear ficha del paciente sin resultados?')) return;
+      const dup = findPossibleDuplicate();
+      if(dup){
+        const ok = confirm(
+          `Ya existe una ficha de "${dup.nombre||'este paciente'}" con fecha ${dup.fecha||'—'}${dup.servicio?(' · '+dup.servicio):''}.\n\n`+
+          `¿Guardar de todas formas como un registro nuevo?\n\n`+
+          `(Si es la misma atención, cancela y ábrela desde el historial para editarla.)`
+        );
+        if(!ok) return;
+      }
+      cancelAutoSave();
+      const isShell = currentTests.length===0;
+      const existing = editingId ? records.find(r=>r.id===editingId) : null;
+      const wasEditing = !!editingId;
+      const rec = await buildRecordFromForm(u, existing);
+      recordsKernel.upsert(rec);
+      sincronizarRecords();
+      lastLocalSaveAt = Date.now();
+      await saveRecords();
+      cloudSetRecord(rec); // no se espera: si no hay internet, Firestore enkola y el guardado local no se bloquea
+      logAudit(wasEditing ? 'update' : 'create', 'resultado', rec.id, {after:{nombre:rec.nombre, servicio:rec.servicio, tests: rec.tests.length}});
+      rememberMedicoServicio(rec.medico, rec.servicio);
+      selectedPatientKey = patientKeyOf(rec);
+      clearSheetNoConfirm();
+      renderPatientCodesBox(rec); // muestra el código del paciente recién guardado, en vez de quedar en blanco
+      renderAll(); // OPTIMIZACIÓN: con las cachés por versión de records esto ya no es 4 recorridos completos
+      renderDirNames();
+      showHistoryTab();
+      renderHistory(); // BUG CORREGIDO: antes quedaba el historial del paciente anterior — renderAll no lo dibuja porque al guardar aún está visible la pestaña "Nuevo"
+      toast(isShell
+        ? 'Ficha del paciente creada sin exámenes aún — cualquier área puede abrirla y agregar los suyos cuando corresponda.'
+        : (wasEditing ? 'Registro actualizado.' : 'Resultado guardado correctamente.'));
+    }catch(e){
+      console.error('handleSave', e);
+      toast('Ocurrió un problema al guardar. Reintenta; si persiste, revisa la conexión.');
     }
-    if(currentTests.length===0 && !confirm('La hoja no tiene exámenes. ¿Crear ficha del paciente sin resultados?')) return;
-    const dup = findPossibleDuplicate();
-    if(dup){
-      const ok = confirm(
-        `Ya existe una ficha de "${dup.nombre||'este paciente'}" con fecha ${dup.fecha||'—'}${dup.servicio?(' · '+dup.servicio):''}.\n\n`+
-        `¿Guardar de todas formas como un registro nuevo?\n\n`+
-        `(Si es la misma atención, cancela y ábrela desde el historial para editarla.)`
-      );
-      if(!ok) return;
-    }
-    cancelAutoSave();
-    const isShell = currentTests.length===0;
-    const existing = editingId ? records.find(r=>r.id===editingId) : null;
-    const wasEditing = !!editingId;
-    const rec = await buildRecordFromForm(u, existing);
-    recordsKernel.upsert(rec);
-    sincronizarRecords();
-    lastLocalSaveAt = Date.now();
-    await saveRecords();
-    cloudSetRecord(rec);
-    logAudit(wasEditing ? 'update' : 'create', 'resultado', rec.id, {after:{nombre:rec.nombre, servicio:rec.servicio, tests: rec.tests.length}});
-    rememberMedicoServicio(rec.medico, rec.servicio);
-    selectedPatientKey = patientKeyOf(rec);
-    clearSheetNoConfirm();
-    renderPatientCodesBox(rec); // muestra el código del paciente recién guardado, en vez de quedar en blanco
-    renderAll();
-    renderDirNames();
-    showHistoryTab();
-    toast(isShell
-      ? 'Ficha del paciente creada sin exámenes aún — cualquier área puede abrirla y agregar los suyos cuando corresponda.'
-      : (wasEditing ? 'Registro actualizado.' : 'Resultado guardado correctamente.'));
   }
 
   // ---------- AUTOGUARDADO EN VIVO (al editar un resultado ya guardado) ----------
@@ -6018,10 +6193,13 @@
 
   function scheduleAutoSave(){
     if(!autoSaveEnabled || !editingId) return;
-    setAutoSaveStatus('saving');
     clearTimeout(autoSaveTimer);
+    // OPTIMIZACIÓN: ya no se muestra "Guardando cambios…" en cada tecla del
+    // panel (el estatus lo marca runAutoSave cuando de verdad empieza a
+    // guardar); antes solo añadía ruido al debounce.
     autoSaveTimer = setTimeout(runAutoSave, 1500);
   }
+  let autoSaveInFlight = false;
   function cancelAutoSave(){
     clearTimeout(autoSaveTimer);
     autoSaveEnabled = false;
@@ -6030,6 +6208,10 @@
 
   async function runAutoSave(){
     if(!autoSaveEnabled || !editingId) return;
+    // OPTIMIZACIÓN (autoguardado): si la escritura anterior (IndexedDB +
+    // nube + renderStats) sigue en curso, no se encadena otra encima: se
+    // deja reprogramada un instante para no perder la última edición.
+    if(autoSaveInFlight){ clearTimeout(autoSaveTimer); autoSaveTimer = setTimeout(runAutoSave, 600); return; }
     const nombre = $('f_nombre').value.trim();
     if(!nombre) return; // el nombre del paciente siempre es obligatorio
     const u = currentUser();
@@ -6037,15 +6219,24 @@
     const existing = records.find(r=>r.id===editingId);
     if(!existing) return;
     if(['released','corrected','void'].includes(existing.status)){ cancelAutoSave(); return; } // protección extra: nunca autoguardar sobre uno ya liberado
-    const rec = await buildRecordFromForm(u, existing);
-    recordsKernel.upsert(rec);
-    sincronizarRecords();
-    lastLocalSaveAt = Date.now();
-    await saveRecords();
-    cloudSetRecord(rec);
-    rememberMedicoServicio(rec.medico, rec.servicio);
-    renderStats();
-    setAutoSaveStatus('saved', 'hace un momento');
+    autoSaveInFlight = true;
+    setAutoSaveStatus('saving');
+    try{
+      const rec = await buildRecordFromForm(u, existing);
+      recordsKernel.upsert(rec);
+      sincronizarRecords();
+      lastLocalSaveAt = Date.now();
+      await saveRecords();
+      cloudSetRecord(rec);
+      rememberMedicoServicio(rec.medico, rec.servicio);
+      renderStats(); // OPTIMIZACIÓN: con las cachés por versión ya no re-corrige todo el historial
+      setAutoSaveStatus('saved', 'hace un momento');
+    }catch(e){
+      console.error('runAutoSave', e);
+      setAutoSaveStatus('off');
+    }finally{
+      autoSaveInFlight = false;
+    }
   }
 
   function checkExternalEdit(rec){
@@ -6788,10 +6979,11 @@
       <ul class="patient-list" id="cfgMetodosList" style="max-height:35vh;margin-top:8px;"></ul>
       <div class="field" style="margin-top:14px;">
         <label>Valores de referencia (intervalos biológicos) <span style="text-transform:none;font-weight:400;">(edítalos aquí si cambian; ya no hace falta tocar el código de SILAB)</span></label>
-        <div style="display:flex;gap:6px;">
-          <input type="text" id="cfgRefExamen" list="catalogTestNames" placeholder="Nombre exacto del examen…" style="flex:1;">
-          <input type="text" id="cfgRefValor" placeholder="Ej. 70–99 o Hombre 4.5–5.9 · Mujer 4.0–5.2" style="flex:1.6;">
-          <button type="button" class="btn secondary" id="btnCfgRefGuardar" style="white-space:nowrap;">Guardar</button>
+        <div style="display:grid;grid-template-columns:1.5fr 1fr 0.8fr auto;gap:8px;align-items:center;margin-top:4px;">
+          <input type="text" id="cfgRefExamen" list="catalogTestNames" placeholder="Nombre exacto del examen…">
+          <input type="text" id="cfgRefValor" placeholder="Ej. 70–99 o Hombre 4.5–5.9 · Mujer 4.0–5.2">
+          <input type="text" id="cfgRefUnidad" placeholder="Unidades (ej. mg/dL)">
+          <button type="button" class="btn secondary" id="btnCfgRefGuardar" style="white-space:nowrap;height:100%;">Guardar</button>
         </div>
         <div class="empty-note" style="padding:6px 0 0;">
           El nuevo valor se aplica a los exámenes que se agreguen a una ficha de aquí en adelante. Los resultados
@@ -6856,15 +7048,24 @@
     $('btnCfgRefGuardar').onclick = async ()=>{
       const nombre = $('cfgRefExamen').value.trim();
       const valor = $('cfgRefValor').value.trim();
+      const unidad = $('cfgRefUnidad').value.trim();
       if(!nombre){ toast('Escribe el nombre del examen.'); return; }
       if(!nombres.includes(nombre)){ toast('Ese nombre no coincide con ningún examen del catálogo. Verifica que esté escrito exactamente igual.'); return; }
       if(!valor){ toast('Escribe el nuevo valor de referencia (o usa "Restablecer" en la lista de abajo para volver al original).'); return; }
-      const anterior = refOverrides[nombre] !== undefined ? refOverrides[nombre] : (DEFAULT_REF[nombre]||'(sin valor)');
-      refOverrides[nombre] = valor;
+
+      const anteriorBruto = refOverrides[nombre];
+      let anterior;
+      if(anteriorBruto && typeof anteriorBruto === 'object') anterior = anteriorBruto.ref + ' ' + (anteriorBruto.unit||'');
+      else anterior = anteriorBruto || (DEFAULT_REF[nombre] + ' ' + (DEFAULT_UNIT[nombre]||'') || '(sin valor)');
+      let anteriorUnit = DEFAULT_UNIT[nombre]||'';
+      if(anteriorBruto && typeof anteriorBruto === 'object' && anteriorBruto.unit !== undefined) anteriorUnit = anteriorBruto.unit;
+
+      refOverrides[nombre] = { ref: valor, unit: unidad };
       applyRefOverrides();
       await saveRefOverrides();
-      logAudit('update', 'config', 'refOverrides', {reason:`Valor de referencia de "${nombre}"`, before:{ref:anterior}, after:{ref:valor}});
-      $('cfgRefExamen').value = ''; $('cfgRefValor').value = '';
+
+      logAudit('update', 'config', 'refOverrides', {reason:`Valor de referencia de "${nombre}"`, before:{ref:anterior, unit:anteriorUnit}, after:{ref:valor, unit:unidad}});
+      $('cfgRefExamen').value = ''; $('cfgRefValor').value = ''; $('cfgRefUnidad').value = '';
       renderCfgRefList();
       toast('Valor de referencia actualizado. Se aplicará a los exámenes que se agreguen de ahora en adelante.');
     };
@@ -6914,20 +7115,30 @@
     });
   }
   function renderCfgRefList(){
-    const nombres = Object.keys(refOverrides).sort((a,b)=>a.localeCompare(b));
-    $('cfgRefList').innerHTML = nombres.length ? nombres.map(n=>`
+    const nombres = Object.keys(refOverrides).filter(n=>refOverrides[n]!==null).sort((a,b)=>a.localeCompare(b));
+    $('cfgRefList').innerHTML = nombres.length ? nombres.map(n=>{
+      const override = refOverrides[n];
+      const esObjeto = (override && typeof override === 'object');
+      const refActual = esObjeto ? override.ref : (override || '');
+      const uniActual = esObjeto ? override.unit : (DEFAULT_UNIT[n] || '');
+      const original = ((DEFAULT_REF[n]||'(sin valor)') + ' ' + (DEFAULT_UNIT[n]||'')).trim();
+      return `
       <li class="patient-item">
         <div><b>${escapeHtml(n)}</b>
-          <div style="font-size:12.5px;opacity:.8;">Ahora: ${escapeHtml(refOverrides[n])}</div>
-          <div style="font-size:11px;opacity:.6;">Original de SILAB: ${escapeHtml(DEFAULT_REF[n]||'(sin valor)')}</div>
+          <div style="font-size:12.5px;opacity:.8;">Ahora: ${escapeHtml(refActual)} ${escapeHtml(uniActual||'')}</div>
+          <div style="font-size:11px;opacity:.6;">Original de SILAB: ${escapeHtml(original)}</div>
         </div>
         <button type="button" class="btn secondary" style="font-size:12px;padding:5px 10px;" data-ref-del="${escapeHtml(n)}">Restablecer</button>
-      </li>`).join('') : '<li class="patient-item">Ningún examen tiene el valor de referencia modificado todavía (todos usan el original de SILAB).</li>';
+      </li>`;}).join('') : '<li class="patient-item">Ningún examen tiene el valor de referencia modificado todavía (todos usan el original de SILAB).</li>';
     $('cfgRefList').querySelectorAll('[data-ref-del]').forEach(btn=>{
       btn.addEventListener('click', async ()=>{
         const nombre = btn.getAttribute('data-ref-del');
         const anterior = refOverrides[nombre];
-        delete refOverrides[nombre];
+        // Si es un default de la tabla oficial, "Restablecer" deja un sentinel
+        // null para que loadRefOverrides no lo reinyecte y applyRefOverrides
+        // vuelva al valor de fábrica. Si era un valor propio, se borra.
+        if(Object.prototype.hasOwnProperty.call(REFS_DEFAULT_OVERRIDE, nombre)) refOverrides[nombre] = null;
+        else delete refOverrides[nombre];
         applyRefOverrides();
         await saveRefOverrides();
         logAudit('update', 'config', 'refOverrides', {reason:`Valor de referencia de "${nombre}" restablecido`, before:{ref:anterior}, after:{ref:DEFAULT_REF[nombre]||''}});
@@ -9469,24 +9680,84 @@
   // clínicamente — no se debe reinterpretar un resultado pasado con un
   // intervalo que no existía cuando se emitió).
   const REF_OVERRIDES_KEY = 'lab:refoverrides';
-  let refOverrides = {}; // { "Glucosa": "74–106", ... }
+  // Tabla oficial de referencia del laboratorio: valores de referencia y
+  // unidades que se inyectan en la capa de sobrescritura como valores POR
+  // DEFECTO (no se toca el CATALOG — es de fábrica). El administrador puede
+  // corregirlos o restablecerlos desde Configuración. "Restablecer" sobre uno
+  // de estos marca un sentinel null (persistente) para que el merge de
+  // loadRefOverrides no lo reinyecte y applyRefOverrides vuelva a DEFAULT_REF.
+  const REFS_DEFAULT_OVERRIDE = {
+    "PCR cuantitativo": { ref: "0 - 5", unit: "mg/L" },
+    "Lipasa": { ref: "13 - 60", unit: "U/L" },
+    "Microalbuminuria": { ref: "Normal: <30 · Microalbuminuria: 30-300 · Albuminuria clínica: >300", unit: "mg/24 hrs" },
+    "HbA1c": { ref: "4.8 - 5.9", unit: "%" },
+    "Proteinuria 24 horas": { ref: "Normal: 30-140 · Embarazadas: hasta 160", unit: "mg/24 hrs" },
+    "Colesterol total": { ref: "Deseable: <200 · Moderadamente alto: 200-239 · Elevado: >240", unit: "mg/dL" },
+    "LDL": { ref: "Riesgo bajo/nulo: <129 · Moderado a elevado: 130-189 · Muy elevado: >190", unit: "mg/dL" },
+    "HDL": { ref: "Hombres: 30-70 · Mujeres: 30-85", unit: "mg/dL" },
+    "Glucosa": { ref: "Adultos: 74-106 · Niños: 60-100 · Neonatos 1 día: 40-60 · >1 día: 50-80", unit: "mg/dL" },
+    "Urea": { ref: "10 - 50", unit: "mg/dL" },
+    "Creatinina": { ref: "Hombre: 0.7-1.3 · Mujer: 0.6-1.1", unit: "mg/dL" },
+    "Triglicéridos": { ref: "Deseable: <150 · Moderadamente alto: 150-199 · Elevado: 200-499 · Muy elevado: >500", unit: "mg/dL" },
+    "Bilirrubina total": { ref: "Adultos: hasta 1 · RN 24h: 1.4-8.7 · RN 48h: 3.4-11.5 · RN 3-5 días: 1.5-12.0", unit: "mg/dL" },
+    "Bilirrubina directa": { ref: "Adultos: hasta 0.2", unit: "mg/dL" },
+    "TGO": { ref: "Hombres: hasta 38 · Mujeres: hasta 32", unit: "U/L" },
+    "TGP": { ref: "Hombres: hasta 29 · Mujeres: hasta 22", unit: "U/L" },
+    "Proteínas totales": { ref: "6.1 - 7.9", unit: "g/dL" },
+    "Albúmina": { ref: "3.5 - 4.8", unit: "g/dL" },
+    "Amilasa": { ref: "hasta 125", unit: "U/L" },
+    "Fosfatasa alcalina": { ref: "Adultos: 65-300 · Niños y adolescentes: hasta 645", unit: "U/L" },
+    "Ácido úrico": { ref: "Hombres: 2.5-6.0 · Mujeres: 2.0-5.0", unit: "mg/dL" },
+    "LDH": { ref: "230 - 460", unit: "U/L" }
+  };
+
+  let refOverrides = {}; // { "Glucosa": { ref:"74–106", unit:"mg/dL" }, ... } (null = default quitado; string plano = valor antiguo)
   let DEFAULT_REF = {};  // { "Glucosa": "70–99", ... } — snapshot del valor original de SILAB
+  let DEFAULT_UNIT = {}; // { "Glucosa": "mg/dL", ... } — snapshot de las unidades originales de SILAB
   function snapshotDefaultRefs(){
     AREA_ORDER.forEach(area=> getCatalogArea(area).forEach(def=>{
       if(!def.panel && !(def.name in DEFAULT_REF)) DEFAULT_REF[def.name] = def.ref || '';
     }));
   }
+  function snapshotDefaultUnits(){
+    AREA_ORDER.forEach(area=> getCatalogArea(area).forEach(def=>{
+      if(!def.panel && !(def.name in DEFAULT_UNIT)) DEFAULT_UNIT[def.name] = def.unit || '';
+    }));
+  }
   function applyRefOverrides(){
     AREA_ORDER.forEach(area=> getCatalogArea(area).forEach(def=>{
       if(def.panel) return;
-      def.ref = (refOverrides[def.name] !== undefined) ? refOverrides[def.name] : (DEFAULT_REF[def.name] !== undefined ? DEFAULT_REF[def.name] : def.ref);
+      const v = refOverrides[def.name];
+      if(v === null){
+        // "Restablecer" sobre un default de la tabla oficial: volver al valor
+        // de fábrica (DEFAULT_REF/DEFAULT_UNIT), no dejar la referencia en null.
+        def.ref = (DEFAULT_REF[def.name] !== undefined) ? DEFAULT_REF[def.name] : def.ref;
+        def.unit = (DEFAULT_UNIT[def.name] !== undefined) ? DEFAULT_UNIT[def.name] : def.unit;
+      } else if(v !== undefined && typeof v === 'object'){
+        // formato nuevo { ref, unit }
+        def.ref = (v.ref !== undefined) ? v.ref : (DEFAULT_REF[def.name] !== undefined ? DEFAULT_REF[def.name] : def.ref);
+        def.unit = (v.unit !== undefined) ? v.unit : (DEFAULT_UNIT[def.name] !== undefined ? DEFAULT_UNIT[def.name] : def.unit);
+      } else {
+        // formato antiguo: string plano (retrocompatibilidad)
+        def.ref = (v !== undefined) ? v : (DEFAULT_REF[def.name] !== undefined ? DEFAULT_REF[def.name] : def.ref);
+      }
     }));
   }
   async function loadRefOverrides(){
     try{
       const res = await storage.get(REF_OVERRIDES_KEY);
-      refOverrides = res && res.value ? JSON.parse(res.value) : {};
-    }catch(e){ refOverrides = {}; }
+      const guardados = res && res.value ? JSON.parse(res.value) : {};
+      // 1. Empezamos con los valores de la tabla del laboratorio
+      // 2. Sobrescribimos con lo que el usuario haya guardado (el usuario manda;
+      //    null = el usuario restableció ese default y debe seguir restablecido)
+      refOverrides = Object.assign({}, REFS_DEFAULT_OVERRIDE, guardados);
+
+      // Guardamos la mezcla en el almacenamiento local para que persista
+      await storage.set(REF_OVERRIDES_KEY, JSON.stringify(refOverrides));
+    }catch(e){
+      // sin sentinel al fallar la lectura: solo los defaults, nunca datos podridos
+      refOverrides = Object.assign({}, REFS_DEFAULT_OVERRIDE);
+    }
   }
   async function saveRefOverrides(){
     try{ await storage.set(REF_OVERRIDES_KEY, JSON.stringify(refOverrides)); }
@@ -10675,8 +10946,16 @@
   $('btnNewPatient').addEventListener('click', ()=>{ selectedPatientKey=null; clearSheet(); showNewTab(); renderPatientList(); $('f_nombre').focus(); });
   $('tabNew').addEventListener('click', showNewTab);
   $('tabHistory').addEventListener('click', ()=>{ showHistoryTab(); renderHistory(); });
-  $('patientSearch').addEventListener('input', renderPatientList);
-  $('catalogSearch').addEventListener('input', renderCatalog);
+  // OPTIMIZACIÓN: retraso de render para las búsquedas — cada tecla
+  // reconstruía toda la lista de pacientes / catálogo de inmediato.
+  function debounceMs(fn, ms){
+    let t = null;
+    return function(...args){ clearTimeout(t); t = setTimeout(()=>fn.apply(this, args), ms); };
+  }
+  const renderPatientListSoon = debounceMs(renderPatientList, 150);
+  const renderCatalogSoon = debounceMs(renderCatalog, 150);
+  $('patientSearch').addEventListener('input', renderPatientListSoon);
+  $('catalogSearch').addEventListener('input', renderCatalogSoon);
   $('btnExportAll').addEventListener('click', exportAll);
   $('btnExportHIS').addEventListener('click', exportHIS);
   $('btnMonthlyReport').addEventListener('click', openMonthlyReport);
@@ -10974,6 +11253,7 @@
     await loadMetodosExamen();
     await loadRefOverrides();
     snapshotDefaultRefs();
+    snapshotDefaultUnits();
     applyRefOverrides();
     await loadCampanaConfig();
     renderListasDatalists();
